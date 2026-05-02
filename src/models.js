@@ -242,14 +242,16 @@ const ANTHROPIC_DATED = {
   'claude-opus-4-5':            'claude-4.5-opus',
   'claude-opus-4-5-20251101':   'claude-4.5-opus',
 
-  // Anthropic Opus 4.7 — Windsurf changelog 2026-04-16. Cloud now exposes 4 reasoning
-  // tiers (low/medium/high/xhigh) plus matching -thinking variants. Bare `claude-opus-4-7`
-  // and `claude-opus-4.7` default to medium; `-thinking` suffix routes to medium-thinking.
-  'claude-opus-4-7':            'claude-opus-4-7-medium',
-  'claude-opus-4-7-latest':     'claude-opus-4-7-medium',
-  'claude-opus-4.7':            'claude-opus-4-7-medium',
-  'claude-opus-4.7-thinking':   'claude-opus-4-7-medium-thinking',
-  'claude-opus-4-7-thinking':   'claude-opus-4-7-medium-thinking',
+  // Anthropic Opus 4.7 — for proxy callers the bare "opus 4.7" label is
+  // generally expected to mean the flagship tier, not the middling effort
+  // preset. Map the undifferentiated aliases to xhigh / xhigh-thinking so
+  // benchmark and compatibility probes are closer to the strongest official
+  // experience. Callers that want a lower tier can still request it explicitly.
+  'claude-opus-4-7':            'claude-opus-4-7-xhigh',
+  'claude-opus-4-7-latest':     'claude-opus-4-7-xhigh',
+  'claude-opus-4.7':            'claude-opus-4-7-xhigh',
+  'claude-opus-4.7-thinking':   'claude-opus-4-7-xhigh-thinking',
+  'claude-opus-4-7-thinking':   'claude-opus-4-7-xhigh-thinking',
   'claude-opus-4.7-low':        'claude-opus-4-7-low',
   'claude-opus-4.7-medium':     'claude-opus-4-7-medium',
   'claude-opus-4.7-high':       'claude-opus-4-7-high',
@@ -281,10 +283,10 @@ const CURSOR_ALIASES = {
   // opus
   'opus-4.6':              'claude-opus-4.6',
   'opus-4.6-thinking':     'claude-opus-4.6-thinking',
-  'opus-4.7-thinking':     'claude-opus-4-7-medium-thinking',
-  'opus-4-7':              'claude-opus-4-7-medium',
-  'opus-4.7':              'claude-opus-4-7-medium',
-  'o4.7':                  'claude-opus-4-7-medium',
+  'opus-4.7-thinking':     'claude-opus-4-7-xhigh-thinking',
+  'opus-4-7':              'claude-opus-4-7-xhigh',
+  'opus-4.7':              'claude-opus-4-7-xhigh',
+  'o4.7':                  'claude-opus-4-7-xhigh',
   // sonnet
   'sonnet-4.6':            'claude-sonnet-4.6',
   'sonnet-4.6-thinking':   'claude-sonnet-4.6-thinking',

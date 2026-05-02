@@ -10,8 +10,11 @@ import https from 'https';
 import { randomUUID } from 'crypto';
 import { existsSync, mkdirSync, writeFileSync } from 'fs';
 import { execSync } from 'child_process';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { log } from './config.js';
 import { extractImages } from './image.js';
+import { humanizeModelName, providerForModelName } from './model-identity.js';
 import { closeSessionForPort, grpcFrame, grpcUnary, grpcStream } from './grpc.js';
 import { getLsEntryByPort } from './langserver.js';
 import {
@@ -191,6 +194,19 @@ export function shouldColdStall({ elapsed, coldStallMs, sawActive, sawText, tota
 // gap. The scaffold is created once per account and persists.
 const _seededWorkspaces = new Set();
 
+function workspaceBaseDir() {
+  // Keep the visible path under /tmp/windsurf-workspace when possible so it
+  // matches the existing redaction/sanitization rules and behaves like a real
+  // Linux-y tool workspace across macOS/Linux hosts. Fall back to the OS tmpdir
+  // only if /tmp itself is unavailable.
+  try {
+    mkdirSync('/tmp/windsurf-workspace', { recursive: true });
+    return '/tmp/windsurf-workspace';
+  } catch {
+    return join(process.env.TEMP || process.env.TMP || tmpdir(), 'windsurf-workspace');
+  }
+}
+
 function ensureWorkspaceDir(workspacePath) {
   if (_seededWorkspaces.has(workspacePath)) return;
   try {
@@ -327,7 +343,7 @@ export class WindsurfClient {
 
     const sessionId = lsEntry.sessionId;
     const wsId = this.apiKey.slice(0, 8).replace(/[^a-z0-9]/gi, 'x');
-    const workspacePath = `/home/user/projects/workspace-${wsId}`;
+    const workspacePath = join(workspaceBaseDir(), `account-${wsId}`);
     const workspaceUri = `file://${workspacePath}`;
 
     const handleWarmupError = (stage, err) => {
@@ -488,11 +504,10 @@ export class WindsurfClient {
       const modelLabel = modelUid
         ? modelUid.replace(/^MODEL_/i, '').replace(/_/g, ' ').toLowerCase()
         : `model-${modelEnum}`;
-      const providerMap = { claude: 'Anthropic', gpt: 'OpenAI', gemini: 'Google', deepseek: 'DeepSeek', grok: 'xAI', qwen: 'Alibaba', kimi: 'Moonshot', glm: 'Zhipu', swe: 'Windsurf' };
-      const providerKey = Object.keys(providerMap).find(k => modelLabel.includes(k)) || '';
-      const provider = providerMap[providerKey] || '';
+      const brandedModel = humanizeModelName(opts.displayModel || modelUid || modelLabel) || opts.displayModel || modelLabel;
+      const provider = providerForModelName(opts.displayModel || modelUid || modelLabel);
       if (provider) {
-        const ctx = `[Context: The underlying model serving this request is ${opts.displayModel || modelLabel}, developed by ${provider}.]`;
+        const ctx = `[Context: The underlying model serving this request is ${brandedModel}, developed by ${provider}.]`;
         sysText = sysText ? sysText + '\n' + ctx : ctx;
       }
 

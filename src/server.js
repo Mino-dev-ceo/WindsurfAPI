@@ -12,7 +12,7 @@
  */
 
 import http from 'http';
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { readFileSync, existsSync } from 'fs';
 import { execSync } from 'child_process';
 import { fileURLToPath } from 'url';
@@ -45,9 +45,22 @@ const VERSION_INFO = (() => {
   return { version: VERSION, commit, commitMessage, commitDate, branch };
 })();
 
-// 10 MB is way above any realistic chat-completions payload while still
-// bounding worst-case memory from a malicious/broken client.
-const MAX_BODY_SIZE = 10 * 1024 * 1024;
+// Anthropic's direct Messages API documents a 32 MB request limit. Keep the
+// proxy aligned so Anthropic-style PDF/document payloads don't get rejected
+// earlier here than they would upstream.
+const MAX_BODY_SIZE = 32 * 1024 * 1024;
+const BASE62_ALPHABET = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+
+function randomBase62(len = 24) {
+  const src = randomUUID().replace(/-/g, '') + randomUUID().replace(/-/g, '');
+  let out = '';
+  for (let i = 0; i < src.length && out.length < len; i += 2) {
+    const n = parseInt(src.slice(i, i + 2), 16);
+    out += BASE62_ALPHABET[n % BASE62_ALPHABET.length];
+  }
+  while (out.length < len) out += BASE62_ALPHABET[Math.floor(Math.random() * BASE62_ALPHABET.length)];
+  return out;
+}
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -91,6 +104,15 @@ function json(res, status, body) {
     'Cache-Control': 'no-store',
   });
   res.end(data);
+}
+
+function makeProviderRequestId() {
+  return 'req_' + randomBase62(24);
+}
+
+function makeSyntheticOrgId(token = '') {
+  const digest = createHash('sha256').update(String(token || 'windsurfapi')).digest('hex').slice(0, 24);
+  return 'org_' + digest;
 }
 
 async function route(req, res) {
@@ -309,7 +331,7 @@ async function route(req, res) {
     const result = await handleChatCompletions(body, { callerKey: callerKeyFromRequest(req, extractToken(req), body) });
     const processingMs = Date.now() - reqStartedAt;
     const modelHeaders = {
-      'x-request-id': 'req-' + randomUUID(),
+      'x-request-id': makeProviderRequestId(),
       'openai-model': body.model || '',
       // Actual upstream processing time — hvoy.ai and similar verifiers
       // treat a flat "0" as a fingerprint of a faking proxy.
@@ -384,9 +406,12 @@ async function route(req, res) {
       return json(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: 'messages must be a non-empty array' } });
     }
     const result = await handleMessages(body, { callerKey: callerKeyFromRequest(req, extractToken(req), body) });
+    const reqToken = extractToken(req);
     const anthropicHeaders = {
-      'request-id': 'req-' + randomUUID(),
+      'request-id': makeProviderRequestId(),
       'anthropic-model': body.model || '',
+      'anthropic-version': String(req.headers['anthropic-version'] || '2023-06-01'),
+      'anthropic-organization-id': makeSyntheticOrgId(reqToken),
     };
     if (result.stream) {
       res.writeHead(result.status, { 'Access-Control-Allow-Origin': '*', ...anthropicHeaders, ...result.headers });

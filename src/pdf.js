@@ -77,7 +77,7 @@ export function extractPdfText(buf) {
 
 /**
  * Extract text from PDF content stream operators.
- * Handles: (text) Tj, [(text)] TJ, Td/Tm for positioning
+ * Handles: (text) Tj, <hex> Tj, [(text) <hex>] TJ, Td/Tm for positioning
  */
 function extractTextOps(stream) {
   const lines = [];
@@ -89,21 +89,29 @@ function extractTextOps(stream) {
 
   for (const block of btBlocks) {
     // (string) Tj — show string
-    const tjMatches = block.matchAll(/\(([^)]*)\)\s*Tj/g);
+    const tjMatches = block.matchAll(/\(((?:\\.|[^\\)])*)\)\s*Tj/g);
     for (const m of tjMatches) {
       currentLine += decodePdfString(m[1]);
     }
 
+    // <hex> Tj — hex-encoded text, often UTF-16BE
+    const hexTjMatches = block.matchAll(/<([0-9A-Fa-f\s]+)>\s*Tj/g);
+    for (const m of hexTjMatches) {
+      currentLine += decodePdfHexString(m[1]);
+    }
+
     // [...] TJ — show strings with spacing
-    const tjArrayMatches = block.matchAll(/\[((?:[^[\]]*|\([^)]*\))*)\]\s*TJ/gi);
+    const tjArrayMatches = block.matchAll(/\[((?:[^[\]]|\\\]|\\\[)*)\]\s*TJ/gi);
     for (const m of tjArrayMatches) {
       const inner = m[1];
-      const parts = inner.matchAll(/\(([^)]*)\)|(-?\d+(?:\.\d+)?)/g);
+      const parts = inner.matchAll(/\(((?:\\.|[^\\)])*)\)|<([0-9A-Fa-f\s]+)>|(-?\d+(?:\.\d+)?)/g);
       for (const p of parts) {
         if (p[1] !== undefined) {
           currentLine += decodePdfString(p[1]);
         } else if (p[2] !== undefined) {
-          const kern = parseFloat(p[2]);
+          currentLine += decodePdfHexString(p[2]);
+        } else if (p[3] !== undefined) {
+          const kern = parseFloat(p[3]);
           if (kern < -100) currentLine += ' ';
         }
       }
@@ -137,6 +145,48 @@ function decodePdfString(s) {
   });
 }
 
+function decodePdfHexString(s) {
+  const hex = String(s || '').replace(/\s+/g, '');
+  if (!hex) return '';
+  const padded = hex.length % 2 === 0 ? hex : `${hex}0`;
+  return decodePdfBinary(Buffer.from(padded, 'hex'));
+}
+
+function decodePdfBinary(buf) {
+  if (!buf?.length) return '';
+  if (buf.length >= 2 && buf[0] === 0xfe && buf[1] === 0xff) {
+    return decodeUtf16Be(buf.subarray(2));
+  }
+  if (buf.length >= 2 && buf[0] === 0xff && buf[1] === 0xfe) {
+    return buf.subarray(2).toString('utf16le');
+  }
+  if (looksLikeUtf16Be(buf)) {
+    return decodeUtf16Be(buf);
+  }
+  return buf.toString('latin1');
+}
+
+function decodeUtf16Be(buf) {
+  const le = Buffer.allocUnsafe(buf.length);
+  for (let i = 0; i < buf.length; i += 2) {
+    le[i] = buf[i + 1] ?? 0x00;
+    le[i + 1] = buf[i];
+  }
+  return le.toString('utf16le');
+}
+
+function looksLikeUtf16Be(buf) {
+  if (!buf || buf.length < 4 || buf.length % 2 !== 0) return false;
+  let zeroHighBytes = 0;
+  let asciiLowBytes = 0;
+  const pairs = buf.length / 2;
+  for (let i = 0; i < buf.length; i += 2) {
+    if (buf[i] === 0x00) zeroHighBytes++;
+    if (buf[i + 1] >= 0x20 && buf[i + 1] <= 0x7e) asciiLowBytes++;
+  }
+  return zeroHighBytes / pairs > 0.5 && asciiLowBytes / pairs > 0.5;
+}
+
 /**
  * Try to extract text from base64-encoded PDF.
  * @param {string} base64Data - Base64 encoded PDF
@@ -158,7 +208,7 @@ export function tryExtractPdf(base64Data) {
   } catch (e) {
     log.warn(`PDF extraction failed: ${e.message}`);
     if (/exceeds safety limit|maxOutputLength|too large|Buffer larger/i.test(e.message) || e.code === 'ERR_BUFFER_TOO_LARGE') {
-      return { text: 'PDF 内容无法提取', pageCount: 0 };
+      return { text: '', pageCount: 0, extractionError: 'too_large' };
     }
     return null;
   }

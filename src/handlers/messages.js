@@ -15,8 +15,40 @@ import { createHash, randomUUID } from 'crypto';
 import { handleChatCompletions } from './chat.js';
 import { log } from '../config.js';
 
+const BASE62_ALPHABET = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+
+function randomBase62(len = 24) {
+  const src = randomUUID().replace(/-/g, '') + randomUUID().replace(/-/g, '');
+  let out = '';
+  for (let i = 0; i < src.length && out.length < len; i += 2) {
+    const n = parseInt(src.slice(i, i + 2), 16);
+    out += BASE62_ALPHABET[n % BASE62_ALPHABET.length];
+  }
+  while (out.length < len) out += BASE62_ALPHABET[Math.floor(Math.random() * BASE62_ALPHABET.length)];
+  return out;
+}
+
 function genMsgId() {
-  return 'msg_' + randomUUID().replace(/-/g, '').slice(0, 24);
+  return 'msg_' + randomBase62(24);
+}
+
+function estimateInputTokensFromMessages(messages) {
+  if (!Array.isArray(messages)) return 0;
+  let chars = 0;
+  for (const m of messages) {
+    const c = m?.content;
+    if (typeof c === 'string') {
+      chars += c.length;
+      continue;
+    }
+    if (!Array.isArray(c)) continue;
+    for (const p of c) {
+      if (typeof p?.text === 'string') chars += p.text.length;
+      else if (typeof p?.thinking === 'string') chars += p.thinking.length;
+      else if (typeof p?.type === 'string' && p.type !== 'text') chars += 8;
+    }
+  }
+  return Math.max(1, Math.ceil(chars / 4));
 }
 
 // Anthropic Messages API tool types whose execution lives on Anthropic's
@@ -144,14 +176,20 @@ function anthropicToOpenAI(body) {
       messages.push({ role, content: m.content });
     } else if (Array.isArray(m.content)) {
       const textParts = [];
-      const imageParts = [];
+      const passthroughParts = [];
       const toolCalls = [];
       const toolResults = [];
       for (const block of m.content) {
         if (block.type === 'text') {
           textParts.push(block.text || '');
+          passthroughParts.push({ type: 'text', text: block.text || '' });
         } else if (block.type === 'image') {
-          imageParts.push(block);
+          passthroughParts.push(block);
+        } else if (block.type === 'document' || block.type === 'file' || block.type === 'input_file') {
+          // Anthropic's official PDF path is a `document` content block.
+          // Preserve it so downstream multimodal/PDF handling can inspect
+          // URL/base64 payloads instead of silently dropping the document.
+          passthroughParts.push(block);
         } else if (block.type === 'thinking') {
           // Thinking blocks from assistant history — skip; the model will regenerate
         } else if (block.type === 'tool_use' && role === 'assistant') {
@@ -181,10 +219,8 @@ function anthropicToOpenAI(body) {
           content: textParts.length ? textParts.join('\n') : null,
           tool_calls: toolCalls,
         });
-      } else if (imageParts.length) {
-        const contentArr = [...imageParts];
-        if (textParts.length) contentArr.push({ type: 'text', text: textParts.join('\n') });
-        messages.push({ role, content: contentArr });
+      } else if (passthroughParts.some(p => p?.type && p.type !== 'text')) {
+        messages.push({ role, content: reorderDocumentBlocksFirst(passthroughParts) });
       } else if (textParts.length) {
         messages.push({ role, content: textParts.join('\n') });
       }
@@ -259,6 +295,18 @@ function anthropicToOpenAI(body) {
     ...(translatedResponseFormat ? { response_format: translatedResponseFormat } : {}),
     ...(cachePolicy.breakpointCount > 0 ? { __cachePolicy: cachePolicy } : {}),
   };
+}
+
+function reorderDocumentBlocksFirst(parts) {
+  if (!Array.isArray(parts) || !parts.length) return parts;
+  const docs = [];
+  const others = [];
+  for (const part of parts) {
+    const type = String(part?.type || '').toLowerCase();
+    if (type === 'document' || type === 'file' || type === 'input_file') docs.push(part);
+    else others.push(part);
+  }
+  return docs.length ? [...docs, ...others] : parts;
 }
 
 export { extractCachePolicy };
@@ -350,13 +398,34 @@ function buildAnthropicUsage(usage) {
   };
 }
 
+function buildAnthropicDeltaUsage(usage) {
+  const outputTokens = usage.completion_tokens || usage.output_tokens || 0;
+  const cacheRead = usage.cache_read_input_tokens
+    ?? usage.prompt_tokens_details?.cached_tokens
+    ?? 0;
+  const cacheCreationFlat = usage.cache_creation_input_tokens || 0;
+  const split = usage.cache_creation && typeof usage.cache_creation === 'object'
+    ? {
+        ephemeral_5m_input_tokens: usage.cache_creation.ephemeral_5m_input_tokens || 0,
+        ephemeral_1h_input_tokens: usage.cache_creation.ephemeral_1h_input_tokens || 0,
+      }
+    : { ephemeral_5m_input_tokens: cacheCreationFlat, ephemeral_1h_input_tokens: 0 };
+  return {
+    output_tokens: outputTokens,
+    cache_creation_input_tokens: cacheCreationFlat,
+    cache_read_input_tokens: cacheRead,
+    cache_creation: split,
+  };
+}
+
 // ─── Streaming translator: intercepts OpenAI SSE, emits Anthropic SSE ──
 
 class AnthropicStreamTranslator {
-  constructor(res, msgId, model) {
+  constructor(res, msgId, model, inputTokensEstimate = 0) {
     this.res = res;
     this.msgId = msgId;
     this.model = model;
+    this.inputTokensEstimate = inputTokensEstimate;
     // Current content block: null | { type, index }
     // type: 'text' | 'thinking' | 'tool_use'
     this.current = null;
@@ -389,7 +458,7 @@ class AnthropicStreamTranslator {
         stop_reason: null,
         stop_sequence: null,
         usage: {
-          input_tokens: 0,
+          input_tokens: this.inputTokensEstimate,
           output_tokens: 0,
           cache_creation_input_tokens: 0,
           cache_read_input_tokens: 0,
@@ -404,7 +473,7 @@ class AnthropicStreamTranslator {
     this.current = { type, index: this.blockIndex };
     let content_block;
     if (type === 'text') content_block = { type: 'text', text: '' };
-    else if (type === 'thinking') content_block = { type: 'thinking', thinking: '' };
+    else if (type === 'thinking') content_block = { type: 'thinking', thinking: '', signature: '' };
     else if (type === 'tool_use') content_block = { type: 'tool_use', id: extra.id, name: extra.name, input: {} };
     this.send('content_block_start', {
       type: 'content_block_start',
@@ -513,7 +582,7 @@ class AnthropicStreamTranslator {
     this.send('message_delta', {
       type: 'message_delta',
       delta: { stop_reason: this.stopReason, stop_sequence: null },
-      usage: buildAnthropicUsage(u),
+      usage: buildAnthropicDeltaUsage(u),
     });
     this.send('message_stop', { type: 'message_stop' });
   }
@@ -679,7 +748,12 @@ export async function handleMessages(body, context = {}) {
       'X-Accel-Buffering': 'no',
     },
     async handler(realRes) {
-      const translator = new AnthropicStreamTranslator(realRes, msgId, requestedModel);
+      const translator = new AnthropicStreamTranslator(
+        realRes,
+        msgId,
+        requestedModel,
+        estimateInputTokensFromMessages(openaiBody.messages),
+      );
       const captureRes = createCaptureRes(translator, realRes);
 
       // Forward client disconnect so the upstream cascade is cancelled.

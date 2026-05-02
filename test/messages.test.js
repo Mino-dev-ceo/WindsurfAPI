@@ -118,6 +118,44 @@ describe('Anthropic messages request translation', () => {
     }
   });
 
+  it('preserves Anthropic document blocks for downstream PDF handling', async () => {
+    let capturedBody = null;
+    await handleMessages({
+      model: 'claude-opus-4.6',
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: 'Summarize this PDF.' },
+          {
+            type: 'document',
+            source: {
+              type: 'url',
+              media_type: 'application/pdf',
+              url: 'https://example.com/demo.pdf',
+            },
+          },
+        ],
+      }],
+    }, {
+      async handleChatCompletions(body) {
+        capturedBody = body;
+        return {
+          status: 200,
+          body: {
+            model: body.model,
+            choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          },
+        };
+      },
+    });
+
+    assert.ok(Array.isArray(capturedBody.messages[0].content));
+    assert.equal(capturedBody.messages[0].content[0].type, 'document');
+    assert.equal(capturedBody.messages[0].content[0].source.url, 'https://example.com/demo.pdf');
+    assert.equal(capturedBody.messages[0].content[1].type, 'text');
+  });
+
   it('annotates risky Read tool_result stubs before Cascade sees them', async () => {
     let capturedBody = null;
     await handleMessages({

@@ -1,11 +1,12 @@
 /**
  * Language server pool manager.
  * Spawns multiple LS instances — one per unique outbound proxy (plus a default
- * no-proxy instance). Accounts are routed to the LS instance matching their
- * configured proxy so that each upstream Codeium request goes out through the
+ * no-proxy instance) by default, or one per account when the caller passes an
+ * owner key. Accounts are routed to the LS instance matching their configured
+ * proxy/account so that each upstream Codeium request goes out through the
  * right egress IP. Also avoids the LS state-pollution bug where switching
- * accounts within a single LS session causes workspace setup streams to be
- * canceled.
+ * accounts within a single LS session causes workspace trust/setup state to
+ * bleed across identities.
  */
 
 import { spawn } from 'child_process';
@@ -42,6 +43,13 @@ function proxyKey(proxy) {
   const safeHost = proxy.host.replace(/[^a-zA-Z0-9]/g, '_');
   const safePort = String(proxy.port || 8080).replace(/[^0-9]/g, '');
   return `px_${safeHost}_${safePort}`;
+}
+
+function lsPoolKey(proxy, ownerKey = null) {
+  const base = proxyKey(proxy);
+  if (!ownerKey) return base;
+  const safeOwner = String(ownerKey).replace(/[^a-zA-Z0-9]/g, '_');
+  return `${base}__acct_${safeOwner}`;
 }
 
 function dataDirForKey(key) {
@@ -179,10 +187,12 @@ async function waitPortReady(port, timeoutMs = 20000) {
 
 /**
  * Spawn an LS instance for the given proxy (or no-proxy default).
+ * When `ownerKey` is provided, the LS is pinned to that account instead of
+ * being shared across accounts on the same proxy.
  * Idempotent — returns the existing entry if one is already running.
  */
-export async function ensureLs(proxy = null) {
-  const key = proxyKey(proxy);
+export async function ensureLs(proxy = null, ownerKey = null) {
+  const key = lsPoolKey(proxy, ownerKey);
   const existing = _pool.get(key);
   if (existing && existing.ready) return existing;
 
@@ -351,23 +361,25 @@ export async function ensureLs(proxy = null) {
  * Used when a proxy is reassigned so the old egress no longer exists.
  */
 export async function restartLsForProxy(proxy) {
-  const key = proxyKey(proxy);
-  const entry = _pool.get(key);
-  if (entry?.process) {
-    try { entry.process.kill('SIGTERM'); } catch {}
+  const baseKey = proxyKey(proxy);
+  for (const [key, entry] of [..._pool.entries()]) {
+    if (key !== baseKey && !key.startsWith(`${baseKey}__acct_`)) continue;
+    if (entry?.process) {
+      try { entry.process.kill('SIGTERM'); } catch {}
+    }
+    if (entry?.port) {
+      // v2.0.25 LOW-1: same-port LS replacement opens a window where stale
+      // pool entries from the old LS could resume against the new LS's
+      // session. Close the cached HTTP/2 session and invalidate this LS's
+      // generation in the conversation pool synchronously, then spawn fresh.
+      closeSessionForPort(entry.port);
+      try {
+        const m = await import('./conversation-pool.js');
+        m.invalidateFor({ lsPort: entry.port, lsGeneration: entry.generation });
+      } catch {}
+    }
+    _pool.delete(key);
   }
-  if (entry?.port) {
-    // v2.0.25 LOW-1: same-port LS replacement opens a window where stale
-    // pool entries from the old LS could resume against the new LS's
-    // session. Close the cached HTTP/2 session and invalidate this LS's
-    // generation in the conversation pool synchronously, then spawn fresh.
-    closeSessionForPort(entry.port);
-    try {
-      const m = await import('./conversation-pool.js');
-      m.invalidateFor({ lsPort: entry.port, lsGeneration: entry.generation });
-    } catch {}
-  }
-  _pool.delete(key);
   return ensureLs(proxy);
 }
 
@@ -378,8 +390,8 @@ export async function restartLsForProxy(proxy) {
  * egress IP (Codeium will see the wrong source, invalidate the session,
  * and falsely mark the account expired).
  */
-export function getLsFor(proxy) {
-  return _pool.get(proxyKey(proxy)) || null;
+export function getLsFor(proxy, ownerKey = null) {
+  return _pool.get(lsPoolKey(proxy, ownerKey)) || null;
 }
 
 /**

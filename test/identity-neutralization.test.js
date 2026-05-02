@@ -14,34 +14,35 @@ import { neutralizeCascadeIdentity } from '../src/handlers/chat.js';
 
 describe('neutralizeCascadeIdentity', () => {
   const model = 'claude-opus-4-7';
+  const branded = 'Claude Opus 4.7';
 
   it('rewrites first-person identity claims', () => {
     assert.equal(
       neutralizeCascadeIdentity('I am Cascade and I will help.', model),
-      `I am ${model} and I will help.`
+      `I am ${branded} and I will help.`
     );
     assert.equal(
       neutralizeCascadeIdentity("I'm Cascade, ready to help.", model),
-      `I'm ${model}, ready to help.`
+      `I'm ${branded}, ready to help.`
     );
     assert.equal(
       neutralizeCascadeIdentity('Hi! my name is Cascade.', model),
-      `Hi! my name is ${model}.`
+      `Hi! my name is ${branded}.`
     );
   });
 
   it('rewrites third-person self-reference', () => {
     assert.equal(
       neutralizeCascadeIdentity('Cascade is an AI coding assistant built by Windsurf.', model),
-      `${model} is an AI assistant built by Anthropic.`
+      `${branded} is an AI assistant built by Anthropic.`
     );
     assert.equal(
       neutralizeCascadeIdentity('As Cascade, I will check that.', model),
-      `As ${model}, I will check that.`
+      `As ${branded}, I will check that.`
     );
     assert.equal(
       neutralizeCascadeIdentity('Acting as Cascade, I will check that.', model),
-      `As ${model}, I will check that.`
+      `As ${branded}, I will check that.`
     );
   });
 
@@ -60,11 +61,11 @@ describe('neutralizeCascadeIdentity', () => {
     );
     assert.equal(
       neutralizeCascadeIdentity("Codeium's Cascade can help with that.", model),
-      `${model} can help with that.`
+      `${branded} can help with that.`
     );
     assert.equal(
       neutralizeCascadeIdentity('Windsurf Cascade is here.', model),
-      `${model} is here.`
+      `${branded} is here.`
     );
   });
 

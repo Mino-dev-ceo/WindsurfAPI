@@ -13,7 +13,18 @@ describe('PDF extraction safety limits', () => {
       Buffer.from('\nendstream\nendobj\n%%EOF', 'latin1'),
     ]);
     const result = tryExtractPdf(pdf.toString('base64'));
-    assert.equal(result.text, 'PDF 内容无法提取');
+    assert.equal(result.text, '');
+    assert.equal(result.extractionError, 'too_large');
+  });
+
+  it('extracts UTF-16BE hex text operators from text-layer PDFs', () => {
+    const stream = Buffer.from('BT\n<FEFF00480069> Tj\nET', 'latin1');
+    const pdf = Buffer.concat([
+      Buffer.from(`%PDF-1.4\n1 0 obj\n<< /Length ${stream.length} >>\nstream\n`, 'latin1'),
+      stream,
+      Buffer.from('\nendstream\nendobj\n%%EOF', 'latin1'),
+    ]);
+    const result = tryExtractPdf(pdf.toString('base64'));
+    assert.equal(result.text, 'Hi');
   });
 });
-

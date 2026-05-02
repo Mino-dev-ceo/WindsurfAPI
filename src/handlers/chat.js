@@ -25,6 +25,7 @@ import {
 } from './tool-emulation.js';
 import { sanitizeText, sanitizeToolCall, PathSanitizeStream } from '../sanitize.js';
 import { registerSseController } from '../sse-registry.js';
+import { humanizeModelName, providerForModelName } from '../model-identity.js';
 
 const HEARTBEAT_MS = 15_000;
 const QUEUE_RETRY_MS = 1_000;
@@ -341,6 +342,23 @@ export function applyJsonResponseHint(messages, responseFormat) {
   return [{ role: 'system', content: sysContent }, ...(Array.isArray(messages) ? messages : [])];
 }
 
+export function applyThinkingChannelHint(messages, wantThinking) {
+  if (!wantThinking || !Array.isArray(messages) || messages.length === 0) return messages;
+  const hint = [
+    'If reasoning is enabled for this request and your runtime supports a separate thinking/reasoning channel,',
+    'place intermediate reasoning in that dedicated channel instead of the final user-visible answer.',
+    'Do not skip the dedicated thinking channel just because the task is simple; a brief reasoning trace is fine.',
+    'Keep the final visible answer concise and user-facing.',
+  ].join(' ');
+
+  const first = messages[0];
+  if (first?.role === 'system' && typeof first.content === 'string') {
+    if (first.content.includes(hint)) return messages;
+    return [{ ...first, content: `${hint}\n\n${first.content}` }, ...messages.slice(1)];
+  }
+  return [{ role: 'system', content: hint }, ...messages];
+}
+
 const CASCADE_REUSE_STRICT = process.env.CASCADE_REUSE_STRICT === '1';
 const CASCADE_REUSE_STRICT_RETRY_MS = (() => {
   const n = parseInt(process.env.CASCADE_REUSE_STRICT_RETRY_MS || '', 10);
@@ -417,7 +435,14 @@ function isOpus47ThinkingAutoRouteEnabled() {
 }
 
 export function resolveEffectiveModelKey(modelKey, wantThinking) {
-  if (!wantThinking || !modelKey || modelKey.includes('thinking')) return modelKey;
+  if (!modelKey) return modelKey;
+  if (modelKey.includes('thinking')) {
+    if (isOpus47ModelKey(modelKey) && !isOpus47ThinkingAutoRouteEnabled()) {
+      return modelKey.replace(/-thinking$/i, '');
+    }
+    return modelKey;
+  }
+  if (!wantThinking) return modelKey;
   const thinkingModelKey = modelKey + '-thinking';
   if (!getModelInfo(thinkingModelKey)) return modelKey;
   if (isOpus47ModelKey(modelKey) && !isOpus47ThinkingAutoRouteEnabled()) {
@@ -585,28 +610,23 @@ function genId() {
   return 'chatcmpl-' + randomUUID().replace(/-/g, '').slice(0, 29);
 }
 
-const MODEL_PROVIDERS = {
-  claude: 'Anthropic', gpt: 'OpenAI', gemini: 'Google', deepseek: 'DeepSeek',
-  grok: 'xAI', qwen: 'Alibaba', kimi: 'Moonshot', glm: 'Zhipu', swe: 'Windsurf',
-  o3: 'OpenAI', o4: 'OpenAI',
-};
-
 export function neutralizeCascadeIdentity(text, modelName) {
   if (!text || !modelName) return text;
-  const provider = MODEL_PROVIDERS[Object.keys(MODEL_PROVIDERS).find(k => modelName.toLowerCase().startsWith(k)) || ''];
+  const provider = providerForModelName(modelName);
+  const brandedModel = humanizeModelName(modelName) || modelName;
   if (!provider) return text;
   return text
     // First-person identity claims
-    .replace(/\bI am Cascade\b/gi, `I am ${modelName}`)
-    .replace(/\bI'm Cascade\b/gi, `I'm ${modelName}`)
-    .replace(/\bmy name is Cascade\b/gi, `my name is ${modelName}`)
+    .replace(/\bI am Cascade\b/gi, `I am ${brandedModel}`)
+    .replace(/\bI'm Cascade\b/gi, `I'm ${brandedModel}`)
+    .replace(/\bmy name is Cascade\b/gi, `my name is ${brandedModel}`)
     // Third-person self-reference common in Cascade prose
-    .replace(/\bCascade, an AI coding assistant\b/gi, `${modelName}, an AI assistant`)
-    .replace(/\bCascade is an? (?:AI )?(?:coding )?assistant\b/gi, `${modelName} is an AI assistant`)
-    .replace(/\b(?:As|Acting as) Cascade\b/g, `As ${modelName}`)
+    .replace(/\bCascade, an AI coding assistant\b/gi, `${brandedModel}, an AI assistant`)
+    .replace(/\bCascade is an? (?:AI )?(?:coding )?assistant\b/gi, `${brandedModel} is an AI assistant`)
+    .replace(/\b(?:As|Acting as) Cascade\b/g, `As ${brandedModel}`)
     // Provider attribution
-    .replace(/\bCascade, made by (?:Codeium|Windsurf)\b/gi, `${modelName}, made by ${provider}`)
-    .replace(/\b(?:Codeium|Windsurf)(?:['’]s)? Cascade\b/g, modelName)
+    .replace(/\bCascade, made by (?:Codeium|Windsurf)\b/gi, `${brandedModel}, made by ${provider}`)
+    .replace(/\b(?:Codeium|Windsurf)(?:['’]s)? Cascade\b/g, brandedModel)
     .replace(/\bdeveloped by (?:Codeium|Windsurf)\b/gi, `developed by ${provider}`)
     .replace(/\bcreated by (?:Codeium|Windsurf)\b/gi, `created by ${provider}`)
     .replace(/\bbuilt by (?:Codeium|Windsurf)\b/gi, `built by ${provider}`)
@@ -1159,6 +1179,7 @@ export async function handleChatCompletions(body, context = {}) {
       provider: modelInfo?.provider || null,
     })
     : [...messages];
+  cascadeMessages = applyThinkingChannelHint(cascadeMessages, wantThinking);
 
   // Note: previous versions injected (a) a CJK language-following hint into
   // the last user message and (b) a per-provider identity system prompt
@@ -1260,7 +1281,7 @@ export async function handleChatCompletions(body, context = {}) {
   }
 
   // ── Local response cache (exact body match) ─────────────
-  const cached = cacheGet(ckey);
+  const cached = !wantThinking ? cacheGet(ckey) : null;
   if (cached) {
     log.info(`Chat: cache HIT model=${displayModel} flow=non-stream`);
     recordRequest(displayModel, true, 0, null);
@@ -1414,8 +1435,8 @@ export async function handleChatCompletions(body, context = {}) {
       }
     }
 
-    await ensureLs(acct.proxy);
-    const ls = getLsFor(acct.proxy);
+    await ensureLs(acct.proxy, acct.id);
+    const ls = getLsFor(acct.proxy, acct.id);
     if (!ls) { lastErr = { status: 503, body: { error: { message: 'No LS instance available', type: 'ls_unavailable' } } }; break; }
     // Cascade pins cascade_id to a specific LS port too; if the LS it was
     // born on has been replaced, the cascade_id is dead.
@@ -1651,7 +1672,7 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
     // responses — they're inherently contextual and the cache doesn't
     // preserve the tool_calls array, so a cache hit would return a
     // content-only response with finish_reason:stop, breaking tool flow.
-    if (ckey && !toolCalls.length) cacheSet(ckey, { text: allText, thinking: allThinking });
+    if (!wantThinking && ckey && !toolCalls.length) cacheSet(ckey, { text: allText, thinking: allThinking });
 
     const message = { role: 'assistant', content: allText || null };
     if (allThinking) message.reasoning_content = allThinking;
@@ -1750,6 +1771,7 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
 function streamResponse(id, created, model, modelKey, provider, messages, cascadeMessages, modelEnum, modelUid, useCascade, ckey, emulateTools, toolPreamble, reqId, wantJson = false, callerKey = '', deps = {}) {
   const checkMessageRateLimitFn = deps.checkMessageRateLimit || checkMessageRateLimit;
   const waitForAccountFn = deps.waitForAccount || waitForAccount;
+  const wantThinking = !!deps.wantThinking;
   // Cache policy threads through deps because streamResponse is a top-level
   // helper, not a closure. Without this, lines that compute TTL hints or
   // attribute usage to ephemeral_5m_input_tokens / ephemeral_1h_input_tokens
@@ -1802,7 +1824,7 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
       res.on('close', stopHeartbeat);
 
       // ── Cache hit: replay stored response as a fake stream ──
-      const cached = cacheGet(ckey);
+      const cached = !wantThinking ? cacheGet(ckey) : null;
       if (cached) {
         log.info(`Chat: cache HIT model=${model} flow=stream`);
         recordRequest(model, true, 0, null);
@@ -2074,8 +2096,8 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
             }
           }
 
-          try { await ensureLs(acct.proxy); } catch (e) { lastErr = e; break; }
-          const ls = getLsFor(acct.proxy);
+          try { await ensureLs(acct.proxy, acct.id); } catch (e) { lastErr = e; break; }
+          const ls = getLsFor(acct.proxy, acct.id);
           if (!ls) { lastErr = new Error('No LS instance available'); break; }
           if (reuseEntry && reuseEntry.lsPort !== ls.port) {
             log.info(`Chat[${reqId}]: reuse MISS — LS port changed`);
@@ -2185,7 +2207,7 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
                 choices: [], usage });
             }
             if (!res.writableEnded) { res.write('data: [DONE]\n\n'); res.end(); }
-            if (ckey && !collectedToolCalls.length && (accText || accThinking)) {
+            if (!wantThinking && ckey && !collectedToolCalls.length && (accText || accThinking)) {
               cacheSet(ckey, { text: accText, thinking: accThinking });
             }
             return;

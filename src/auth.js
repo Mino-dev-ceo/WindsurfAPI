@@ -656,7 +656,7 @@ export async function ensureLsForAccount(accountId) {
   const account = accounts.find(a => a.id === accountId);
   const proxy = getEffectiveProxy(accountId) || null;
   try {
-    const ls = await ensureLs(proxy);
+    const ls = await ensureLs(proxy, accountId);
     // Pre-warm the Cascade workspace init so the first real request on this
     // LS doesn't pay the 3-roundtrip setup cost. Fire-and-forget — chat
     // requests still await the same Promise if it hasn't finished yet.
@@ -994,8 +994,8 @@ export async function fetchUserStatus(id) {
   const { WindsurfClient } = await import('./client.js');
   const { ensureLs, getLsFor } = await import('./langserver.js');
   const proxy = getEffectiveProxy(account.id) || null;
-  await ensureLs(proxy);
-  const ls = getLsFor(proxy);
+  await ensureLs(proxy, account.id);
+  const ls = getLsFor(proxy, account.id);
   if (!ls) { log.warn(`No LS for GetUserStatus on ${account.id}`); return null; }
 
   const client = new WindsurfClient(account.apiKey, ls.port, ls.csrfToken);
@@ -1115,8 +1115,8 @@ async function _probeAccountImpl(account) {
   const { ensureLs, getLsFor } = await import('./langserver.js');
 
   const proxy = getEffectiveProxy(account.id) || null;
-  await ensureLs(proxy);
-  const ls = getLsFor(proxy);
+  await ensureLs(proxy, account.id);
+  const ls = getLsFor(proxy, account.id);
   if (!ls) { log.error(`No LS available for account ${account.id}`); return null; }
   const port = ls.port;
   const csrf = ls.csrfToken;
@@ -1373,17 +1373,12 @@ export async function initAuth() {
     refreshAllFirebaseTokens().catch(e => log.warn(`Scheduled token refresh: ${e.message}`));
   }, TOKEN_REFRESH_INTERVAL).unref?.();
 
-  // Warm up an LS instance for each account's configured proxy so the first
-  // chat request doesn't pay the spawn cost.
+  // Warm up an LS instance for each account so workspace trust/session state
+  // stays isolated across identities even when they share the same proxy.
   const { ensureLs } = await import('./langserver.js');
-  const uniqueProxies = new Map();
   for (const a of accounts) {
     const p = getEffectiveProxy(a.id);
-    const k = p ? `${p.host}:${p.port}` : 'default';
-    if (!uniqueProxies.has(k)) uniqueProxies.set(k, p || null);
-  }
-  for (const p of uniqueProxies.values()) {
-    try { await ensureLs(p); }
+    try { await ensureLs(p, a.id); }
     catch (e) { log.warn(`LS warmup failed: ${e.message}`); }
   }
 
