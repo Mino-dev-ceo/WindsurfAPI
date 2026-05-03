@@ -2,6 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { deflateSync } from 'node:zlib';
 import { tryExtractPdf } from '../src/pdf.js';
+import { extractImages } from '../src/image.js';
 
 describe('PDF extraction safety limits', () => {
   it('falls back when a compressed stream expands beyond the per-stream limit', () => {
@@ -26,5 +27,22 @@ describe('PDF extraction safety limits', () => {
     ]);
     const result = tryExtractPdf(pdf.toString('base64'));
     assert.equal(result.text, 'Hi');
+  });
+
+  it('extracts OpenAI Responses input_file blocks with top-level file_data', async () => {
+    const stream = Buffer.from('BT\n(Invoice total: 42) Tj\nET', 'latin1');
+    const pdf = Buffer.concat([
+      Buffer.from(`%PDF-1.4\n1 0 obj\n<< /Length ${stream.length} >>\nstream\n`, 'latin1'),
+      stream,
+      Buffer.from('\nendstream\nendobj\n%%EOF', 'latin1'),
+    ]);
+    const result = await extractImages([
+      {
+        type: 'input_file',
+        filename: 'invoice.pdf',
+        file_data: `data:application/pdf;base64,${pdf.toString('base64')}`,
+      },
+    ]);
+    assert.match(result.text, /Invoice total: 42/);
   });
 });

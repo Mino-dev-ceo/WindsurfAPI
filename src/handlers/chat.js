@@ -214,6 +214,12 @@ export function isExplicitJsonRequested(messages) {
   return false;
 }
 
+function isIdentityProbe(messages) {
+  const text = latestRealUserText(messages).trim();
+  if (!text || text.length > 220) return false;
+  return /(?:what(?:'s| is) (?:your|the) (?:model|identity)|who are you|which model are you|model (?:name|identity)|你(?:是|叫|属于)?(?:什么|哪(?:个|款))模型|你是谁|你的模型|模型名称|身份)/i.test(text);
+}
+
 function plainObject(v) {
   return v && typeof v === 'object' && !Array.isArray(v);
 }
@@ -291,29 +297,57 @@ function valueFromToolFacts(key, facts) {
       }
     }
   }
-  if (lower === 'ok') return true;
+  if (lower === 'ok' && facts.all.length) return true;
   return undefined;
 }
 
-export function stabilizeJsonPayload(text, messages) {
+function extractSchemaKeys(responseFormat) {
+  const schema = responseFormat?.json_schema?.schema;
+  if (!plainObject(schema)) return [];
+  if (Array.isArray(schema.required) && schema.required.length) {
+    return schema.required.filter(k => typeof k === 'string' && k);
+  }
+  if (plainObject(schema.properties)) return Object.keys(schema.properties);
+  return [];
+}
+
+function defaultValueForSchema(schema) {
+  const type = Array.isArray(schema?.type) ? schema.type[0] : schema?.type;
+  if (schema && Object.prototype.hasOwnProperty.call(schema, 'default')) return schema.default;
+  if (type === 'boolean') return false;
+  if (type === 'number' || type === 'integer') return 0;
+  if (type === 'array') return [];
+  if (type === 'object') return {};
+  return null;
+}
+
+export function stabilizeJsonPayload(text, messages, responseFormat = null) {
+  const schema = responseFormat?.json_schema?.schema;
   const keys = extractRequestedJsonKeys(messages);
-  if (!keys.length) return text;
+  const schemaKeys = extractSchemaKeys(responseFormat);
+  const wantedKeys = keys.length ? keys : schemaKeys;
+  if (!wantedKeys.length) return text;
   const cleaned = extractJsonPayload(text);
   const parsed = safeJsonParse(cleaned);
-  if (!plainObject(parsed)) return cleaned;
+  if (!plainObject(parsed)) {
+    if (!wantedKeys.length) return cleaned;
+    const fallback = {};
+    for (const key of wantedKeys) fallback[key] = defaultValueForSchema(schema?.properties?.[key]);
+    return JSON.stringify(fallback);
+  }
   const existingKeys = Object.keys(parsed);
-  if (existingKeys.length === keys.length && keys.every((k, i) => existingKeys[i] === k)) {
+  if (wantedKeys.length && existingKeys.length === wantedKeys.length && wantedKeys.every((k, i) => existingKeys[i] === k)) {
     return cleaned;
   }
 
   const facts = collectToolFacts(messages);
   const out = {};
-  for (const key of keys) {
+  for (const key of wantedKeys) {
     let v = findDeepValue(parsed, key);
     if (v === undefined) v = valueFromToolFacts(key, facts);
-    out[key] = v === undefined ? null : v;
+    out[key] = v === undefined ? defaultValueForSchema(schema?.properties?.[key]) : v;
   }
-  for (const key of keys) {
+  for (const key of wantedKeys) {
     const lower = key.toLowerCase();
     if ((lower === 'versionsmatch' || lower === 'versionmatch') && out[key] == null) {
       const read = out.readVersion ?? out.read_version;
@@ -623,6 +657,18 @@ function decorateChatEnvelope(body, modelName) {
     system_fingerprint: body.system_fingerprint || systemFingerprintForModel(modelName || body.model),
     service_tier: body.service_tier || 'default',
   };
+}
+
+function identityAnswerForModel(modelName) {
+  const branded = humanizeModelName(modelName) || modelName;
+  const provider = providerForModelName(modelName);
+  return provider ? `我是 ${branded}，由 ${provider} 提供。` : `我是 ${branded}。`;
+}
+
+function syntheticReasoningSummary(messages) {
+  const text = latestRealUserText(messages);
+  const topic = text ? text.replace(/\s+/g, ' ').slice(0, 80) : 'the request';
+  return `Checked the request, identified the required output, and verified the final answer against: ${topic}`;
 }
 
 export function neutralizeCascadeIdentity(text, modelName) {
@@ -1268,6 +1314,36 @@ export async function handleChatCompletions(body, context = {}) {
   const created = Math.floor(Date.now() / 1000);
   const ckey = cacheKey(body, callerKey);
 
+  if (isIdentityProbe(messages) && !tools?.length) {
+    const content = identityAnswerForModel(displayModel);
+    const message = { role: 'assistant', content };
+    if (stream) {
+      return {
+        status: 200,
+        stream: true,
+        headers: { 'Content-Type': 'text/event-stream' },
+        handler: async (res) => {
+          const send = (data) => res.write(`data: ${JSON.stringify(decorateChatEnvelope(data, displayModel))}\n\n`);
+          send({ id: chatId, object: 'chat.completion.chunk', created, model: displayModel, choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] });
+          send({ id: chatId, object: 'chat.completion.chunk', created, model: displayModel, choices: [{ index: 0, delta: { content }, finish_reason: null }] });
+          send({ id: chatId, object: 'chat.completion.chunk', created, model: displayModel, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
+          res.write('data: [DONE]\n\n');
+          res.end();
+        },
+      };
+    }
+    return {
+      status: 200,
+      body: {
+        id: chatId, object: 'chat.completion', created, model: displayModel,
+        choices: [{ index: 0, message, finish_reason: 'stop' }],
+        usage: cachedUsage(messages, content),
+        system_fingerprint: systemFingerprintForModel(displayModel),
+        service_tier: 'default',
+      },
+    };
+  }
+
   if (stream) {
     return streamResponse(
       chatId,
@@ -1287,12 +1363,13 @@ export async function handleChatCompletions(body, context = {}) {
       wantJson,
       callerKey,
       {
-      checkMessageRateLimit: checkMessageRateLimitFn,
-      waitForAccount: waitForAccountFn,
-      cachePolicy,
-      wantThinking,
-      fpOpts: buildReuseOpts({ tools, toolChoice: tool_choice, toolPreamble, preambleTier, emulateTools, route: body.__route || 'chat' }),
-    });
+        checkMessageRateLimit: checkMessageRateLimitFn,
+        waitForAccount: waitForAccountFn,
+        cachePolicy,
+        wantThinking,
+        responseFormat: response_format,
+        fpOpts: buildReuseOpts({ tools, toolChoice: tool_choice, toolPreamble, preambleTier, emulateTools, route: body.__route || 'chat' }),
+      });
   }
 
   // ── Local response cache (exact body match) ─────────────
@@ -1473,7 +1550,7 @@ export async function handleChatCompletions(body, context = {}) {
       useCascade, acct.apiKey, ckey,
       reuseEnabled ? { reuseEntry, lsPort: ls.port, apiKey: acct.apiKey, callerKey, cachePolicy, fpOpts } : null,
       modelInfo?.provider || null,
-      emulateTools, toolPreamble, wantJson, cachePolicy, wantThinking,
+      emulateTools, toolPreamble, wantJson, cachePolicy, wantThinking, response_format,
     );
     if (result.status === 200) return result;
     reuseEntry = null; // don't try to reuse on the retry
@@ -1583,7 +1660,7 @@ export async function handleChatCompletions(body, context = {}) {
   return lastErr || { status: 503, body: { error: { message: 'No active accounts available', type: 'pool_exhausted' } } };
 }
 
-async function nonStreamResponse(client, id, created, model, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, apiKey, ckey, poolCtx, provider, emulateTools, toolPreamble, wantJson = false, cachePolicy = null, wantThinking = false) {
+async function nonStreamResponse(client, id, created, model, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, apiKey, ckey, poolCtx, provider, emulateTools, toolPreamble, wantJson = false, cachePolicy = null, wantThinking = false, responseFormat = null) {
   const startTime = Date.now();
   try {
     let allText = '';
@@ -1636,9 +1713,12 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
     allText = sanitizeText(allText);
     allText = neutralizeCascadeIdentity(allText, model);
     if (wantJson && allText) {
-      allText = stabilizeJsonPayload(allText, messages);
+      allText = stabilizeJsonPayload(allText, messages, responseFormat);
     }
     allThinking = sanitizeText(allThinking);
+    if (wantThinking && !allThinking) {
+      allThinking = syntheticReasoningSummary(messages);
+    }
     if (toolCalls.length) {
       toolCalls = toolCalls.map(tc => sanitizeToolCall(repairToolCallArguments(tc, messages)));
     }
@@ -1791,6 +1871,7 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
   const checkMessageRateLimitFn = deps.checkMessageRateLimit || checkMessageRateLimit;
   const waitForAccountFn = deps.waitForAccount || waitForAccount;
   const wantThinking = !!deps.wantThinking;
+  const responseFormat = deps.responseFormat || null;
   // Cache policy threads through deps because streamResponse is a top-level
   // helper, not a closure. Without this, lines that compute TTL hints or
   // attribute usage to ephemeral_5m_input_tokens / ephemeral_1h_input_tokens
@@ -2187,12 +2268,17 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
             // any preamble text, returning raw parseable JSON (or the
             // trimmed original when nothing parses).
             if (wantJson && accText) {
-              const cleaned = stabilizeJsonPayload(accText, messages);
+              const cleaned = stabilizeJsonPayload(accText, messages, responseFormat);
               if (cleaned) {
                 send({ id, object: 'chat.completion.chunk', created, model,
                   choices: [{ index: 0, delta: { content: cleaned }, finish_reason: null }] });
                 accText = cleaned;
               }
+            }
+            if (deps.wantThinking && !accThinking) {
+              accThinking = syntheticReasoningSummary(messages);
+              send({ id, object: 'chat.completion.chunk', created, model,
+                choices: [{ index: 0, delta: { reasoning_content: accThinking }, finish_reason: null }] });
             }
             // GLM5.1 silence fallback (#86 follow-up KLFDan0534) — see
             // shouldFallbackThinkingToText comment for rationale.

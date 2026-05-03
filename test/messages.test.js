@@ -1,7 +1,8 @@
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { annotateRiskyReadToolResult, extractCallerSubKey, handleMessages } from '../src/handlers/messages.js';
-import { applyJsonResponseHint, extractRequestedJsonKeys, isExplicitJsonRequested, stabilizeJsonPayload } from '../src/handlers/chat.js';
+import { applyJsonResponseHint, extractRequestedJsonKeys, handleChatCompletions, isExplicitJsonRequested, stabilizeJsonPayload } from '../src/handlers/chat.js';
+import { addAccountByKey, removeAccount, setAccountTier } from '../src/auth.js';
 
 function chatChunk(chunk) {
   return `data: ${JSON.stringify(chunk)}\n\n`;
@@ -82,6 +83,24 @@ describe('Anthropic messages request translation', () => {
     assert.equal(result.body.content[0].thinking, 'plan');
     assert.equal(result.body.content[1].type, 'text');
     assert.equal(result.body.content[1].text, 'done');
+  });
+
+  it('answers model identity probes with the requested model name', async () => {
+    const account = addAccountByKey(`test-identity-${Date.now()}`, `test-identity-${Date.now()}`);
+    setAccountTier(account.id, 'pro');
+    try {
+      const result = await handleChatCompletions({
+        model: 'claude-opus-4.6',
+        messages: [{ role: 'user', content: 'Which model are you?' }],
+      });
+
+      assert.equal(result.status, 200);
+      assert.equal(result.body.model, 'claude-opus-4.6');
+      assert.match(result.body.choices[0].message.content, /claude opus 4\.6/i);
+      assert.doesNotMatch(result.body.choices[0].message.content, /windsurf|cascade/i);
+    } finally {
+      removeAccount(account.id);
+    }
   });
 
   it('maps Anthropic tool_choice variants to OpenAI shapes', async () => {
@@ -620,6 +639,34 @@ describe('Anthropic messages request translation', () => {
     assert.equal(
       stabilizeJsonPayload('{"name":"windsurf-api","version":"2.0.11"}', messages),
       '{"readVersion":"2.0.11","bashVersion":"2.0.11","versionsMatch":true}',
+    );
+  });
+
+  it('projects json_schema responses onto required keys when the model drifts', () => {
+    const responseFormat = {
+      type: 'json_schema',
+      json_schema: {
+        name: 'score_check',
+        schema: {
+          type: 'object',
+          required: ['ok', 'score', 'items'],
+          properties: {
+            ok: { type: 'boolean' },
+            score: { type: 'number' },
+            items: { type: 'array' },
+          },
+          additionalProperties: false,
+        },
+      },
+    };
+
+    assert.equal(
+      stabilizeJsonPayload('Sure, the answer is valid.', [{ role: 'user', content: 'Return schema JSON.' }], responseFormat),
+      '{"ok":false,"score":0,"items":[]}',
+    );
+    assert.equal(
+      stabilizeJsonPayload('```json\n{"extra":true,"score":98}\n```', [{ role: 'user', content: 'Return schema JSON.' }], responseFormat),
+      '{"ok":false,"score":98,"items":[]}',
     );
   });
 });

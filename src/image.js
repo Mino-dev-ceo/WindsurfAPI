@@ -333,8 +333,8 @@ export async function extractImages(contentBlocks) {
       logBlock(block);
       // OpenAI PDF input: { type:'file', file:{ filename, file_data:'data:application/pdf;base64,...' } }
       // or file_id (uploaded via Files API — we can't fetch, so ignore).
-      const file = block.file || {};
-      const dataUrl = file.file_data || file.url || '';
+      const file = block.file || block;
+      const dataUrl = file.file_data || block.file_data || file.url || block.url || '';
       if (dataUrl.startsWith('data:application/pdf')) {
         const g = parseGenericDataUrl(dataUrl);
         if (g?.base64_data) {
@@ -360,10 +360,10 @@ export async function extractImages(contentBlocks) {
         } catch (e) {
           log.warn(`File URL fetch failed: ${e.message}`);
         }
-      } else if (dataUrl && !file.file_id) {
+      } else if (dataUrl && !(file.file_id || block.file_id)) {
         log.warn(`Unsupported file block data URL: ${dataUrl.slice(0, 40)}...`);
-      } else if (file.file_id) {
-        log.warn(`File block references file_id=${file.file_id} — upload API not supported, skipping`);
+      } else if (file.file_id || block.file_id) {
+        log.warn(`File block references file_id=${file.file_id || block.file_id} — upload API not supported, skipping`);
       }
     }
   }
