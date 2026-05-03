@@ -81,6 +81,7 @@ describe('Anthropic messages request translation', () => {
     assert.equal(result.status, 200);
     assert.equal(result.body.content[0].type, 'thinking');
     assert.equal(result.body.content[0].thinking, 'plan');
+    assert.match(result.body.content[0].signature, /^[A-Za-z0-9+/=]+$/);
     assert.equal(result.body.content[1].type, 'text');
     assert.equal(result.body.content[1].text, 'done');
   });
@@ -556,6 +557,34 @@ describe('Anthropic messages request translation', () => {
     const signatureDelta = events.find(e => e.event === 'content_block_delta' && e.data.delta?.type === 'signature_delta');
     assert.ok(signatureDelta, 'expected a signature_delta event');
     assert.match(signatureDelta.data.delta.signature, /^[A-Za-z0-9+/=]+$/);
+  });
+
+  it('includes a thinking signature on non-stream responses', async () => {
+    const result = await handleMessages({
+      model: 'claude-opus-4.6',
+      thinking: { type: 'adaptive' },
+      messages: [{ role: 'user', content: 'think aloud' }],
+      stream: false,
+    }, {
+      async handleChatCompletions() {
+        return {
+          status: 200,
+          body: {
+            model: 'claude-opus-4.6',
+            choices: [{
+              index: 0,
+              message: { role: 'assistant', reasoning_content: 'plan', content: 'done' },
+              finish_reason: 'stop',
+            }],
+            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          },
+        };
+      },
+    });
+
+    assert.equal(result.status, 200);
+    assert.equal(result.body.content[0].type, 'thinking');
+    assert.match(result.body.content[0].signature, /^[A-Za-z0-9+/=]+$/);
   });
 
   it('detects explicit JSON requests without response_format', () => {

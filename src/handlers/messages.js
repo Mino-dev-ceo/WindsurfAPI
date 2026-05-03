@@ -73,6 +73,10 @@ function sha256Base64(value) {
   return createHash('sha256').update(String(value || '')).digest('base64');
 }
 
+function buildThinkingSignature(msgId, model, thinking) {
+  return sha256Base64(`mino-thinking-signature:${msgId}:${model}:${thinking || ''}`);
+}
+
 // Real Claude Code 2.1.120 traffic carries metadata.user_id as a
 // JSON-encoded string with shape {device_id, account_uuid, session_id}.
 // Older Anthropic SDK clients send a plain string. The proxy currently
@@ -344,7 +348,12 @@ function openAIToAnthropic(result, model, msgId) {
   const usage = result.usage || {};
   const content = [];
   if (choice?.message?.reasoning_content) {
-    content.push({ type: 'thinking', thinking: choice.message.reasoning_content });
+    const thinking = choice.message.reasoning_content;
+    content.push({
+      type: 'thinking',
+      thinking,
+      signature: buildThinkingSignature(msgId, model, thinking),
+    });
   }
   if (choice?.message?.tool_calls?.length) {
     if (choice.message.content) content.push({ type: 'text', text: choice.message.content });
@@ -480,7 +489,11 @@ class AnthropicStreamTranslator {
     if (type === 'text') content_block = { type: 'text', text: '' };
     else if (type === 'thinking') {
       this.activeThinking = '';
-      content_block = { type: 'thinking', thinking: '', signature: '' };
+      content_block = {
+        type: 'thinking',
+        thinking: '',
+        signature: buildThinkingSignature(this.msgId, this.model, ''),
+      };
     }
     else if (type === 'tool_use') content_block = { type: 'tool_use', id: extra.id, name: extra.name, input: {} };
     this.send('content_block_start', {
@@ -520,7 +533,7 @@ class AnthropicStreamTranslator {
 
   emitThinkingSignature() {
     if (this.current?.type !== 'thinking') return;
-    const signature = sha256Base64(`mino-thinking-signature:${this.msgId}:${this.model}:${this.activeThinking}`);
+    const signature = buildThinkingSignature(this.msgId, this.model, this.activeThinking);
     this.send('content_block_delta', {
       type: 'content_block_delta',
       index: this.current.index,
