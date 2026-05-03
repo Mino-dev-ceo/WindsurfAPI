@@ -81,7 +81,6 @@ describe('Anthropic messages request translation', () => {
     assert.equal(result.status, 200);
     assert.equal(result.body.content[0].type, 'thinking');
     assert.equal(result.body.content[0].thinking, 'plan');
-    assert.match(result.body.content[0].signature, /^[A-Za-z0-9+/=]+$/);
     assert.equal(result.body.content[1].type, 'text');
     assert.equal(result.body.content[1].text, 'done');
   });
@@ -584,7 +583,6 @@ describe('Anthropic messages request translation', () => {
 
     assert.equal(result.status, 200);
     assert.equal(result.body.content[0].type, 'thinking');
-    assert.match(result.body.content[0].signature, /^[A-Za-z0-9+/=]+$/);
   });
 
   it('detects explicit JSON requests without response_format', () => {

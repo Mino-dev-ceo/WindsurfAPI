@@ -74,7 +74,14 @@ function sha256Base64(value) {
 }
 
 function buildThinkingSignature(msgId, model, thinking) {
-  return sha256Base64(`mino-thinking-signature:${msgId}:${model}:${thinking || ''}`);
+  const seed = `mino-thinking-signature:${msgId}:${model}:${thinking || ''}`;
+  const parts = [
+    createHash('sha512').update(`${seed}:0`).digest(),
+    createHash('sha512').update(`${seed}:1`).digest(),
+    createHash('sha512').update(`${seed}:2`).digest(),
+    createHash('sha256').update(`${seed}:3`).digest(),
+  ];
+  return Buffer.concat(parts).toString('base64');
 }
 
 // Real Claude Code 2.1.120 traffic carries metadata.user_id as a
@@ -489,11 +496,7 @@ class AnthropicStreamTranslator {
     if (type === 'text') content_block = { type: 'text', text: '' };
     else if (type === 'thinking') {
       this.activeThinking = '';
-      content_block = {
-        type: 'thinking',
-        thinking: '',
-        signature: buildThinkingSignature(this.msgId, this.model, ''),
-      };
+      content_block = { type: 'thinking', thinking: '' };
     }
     else if (type === 'tool_use') content_block = { type: 'tool_use', id: extra.id, name: extra.name, input: {} };
     this.send('content_block_start', {
