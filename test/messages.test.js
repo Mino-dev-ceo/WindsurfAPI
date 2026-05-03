@@ -529,6 +529,35 @@ describe('Anthropic messages request translation', () => {
     assert.equal(capturedBody.reasoning_effort, 'high');
   });
 
+  it('emits a signature delta for thinking blocks', async () => {
+    const result = await handleMessages({
+      model: 'claude-opus-4.6',
+      thinking: { type: 'adaptive' },
+      messages: [{ role: 'user', content: 'think aloud' }],
+      stream: true,
+    }, {
+      async handleChatCompletions() {
+        return {
+          status: 200,
+          stream: true,
+          async handler(res) {
+            res.write(chatChunk({ choices: [{ index: 0, delta: { reasoning_content: 'plan' }, finish_reason: null }] }));
+            res.write(chatChunk({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }));
+            res.write(chatChunk({ choices: [], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } }));
+            res.end('data: [DONE]\n\n');
+          },
+        };
+      },
+    });
+
+    const res = fakeRes();
+    await result.handler(res);
+    const events = parseAnthropicEvents(res.body);
+    const signatureDelta = events.find(e => e.event === 'content_block_delta' && e.data.delta?.type === 'signature_delta');
+    assert.ok(signatureDelta, 'expected a signature_delta event');
+    assert.match(signatureDelta.data.delta.signature, /^[A-Za-z0-9+/=]+$/);
+  });
+
   it('detects explicit JSON requests without response_format', () => {
     assert.equal(isExplicitJsonRequested([
       { role: 'user', content: 'Read package.json and answer only compact JSON with name and version.' },

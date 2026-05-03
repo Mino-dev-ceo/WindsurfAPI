@@ -69,6 +69,10 @@ function sha256Hex(value) {
   return createHash('sha256').update(String(value || '')).digest('hex');
 }
 
+function sha256Base64(value) {
+  return createHash('sha256').update(String(value || '')).digest('base64');
+}
+
 // Real Claude Code 2.1.120 traffic carries metadata.user_id as a
 // JSON-encoded string with shape {device_id, account_uuid, session_id}.
 // Older Anthropic SDK clients send a plain string. The proxy currently
@@ -436,6 +440,7 @@ class AnthropicStreamTranslator {
     this.messageStarted = false;
     this.messageStopped = false;
     this.pendingSseBuf = '';
+    this.activeThinking = '';
   }
 
   send(event, data) {
@@ -473,7 +478,10 @@ class AnthropicStreamTranslator {
     this.current = { type, index: this.blockIndex };
     let content_block;
     if (type === 'text') content_block = { type: 'text', text: '' };
-    else if (type === 'thinking') content_block = { type: 'thinking', thinking: '', signature: '' };
+    else if (type === 'thinking') {
+      this.activeThinking = '';
+      content_block = { type: 'thinking', thinking: '', signature: '' };
+    }
     else if (type === 'tool_use') content_block = { type: 'tool_use', id: extra.id, name: extra.name, input: {} };
     this.send('content_block_start', {
       type: 'content_block_start',
@@ -502,10 +510,21 @@ class AnthropicStreamTranslator {
   emitThinkingDelta(text) {
     if (!text) return;
     if (this.current?.type !== 'thinking') this.startBlock('thinking');
+    this.activeThinking += text;
     this.send('content_block_delta', {
       type: 'content_block_delta',
       index: this.current.index,
       delta: { type: 'thinking_delta', thinking: text },
+    });
+  }
+
+  emitThinkingSignature() {
+    if (this.current?.type !== 'thinking') return;
+    const signature = sha256Base64(`mino-thinking-signature:${this.msgId}:${this.model}:${this.activeThinking}`);
+    this.send('content_block_delta', {
+      type: 'content_block_delta',
+      index: this.current.index,
+      delta: { type: 'signature_delta', signature },
     });
   }
 
@@ -577,6 +596,9 @@ class AnthropicStreamTranslator {
   finish() {
     if (this.messageStopped) return;
     this.messageStopped = true;
+    if (this.current?.type === 'thinking' && this.activeThinking) {
+      this.emitThinkingSignature();
+    }
     this.closeCurrentBlock();
     const u = this.finalUsage || {};
     this.send('message_delta', {
