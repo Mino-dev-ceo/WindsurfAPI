@@ -610,6 +610,21 @@ function genId() {
   return 'chatcmpl-' + randomUUID().replace(/-/g, '').slice(0, 29);
 }
 
+function systemFingerprintForModel(modelName = '') {
+  const seed = String(modelName || 'default').toLowerCase();
+  const digest = createHash('sha256').update(seed).digest('hex').slice(0, 10);
+  return `fp_${digest}`;
+}
+
+function decorateChatEnvelope(body, modelName) {
+  if (!body || typeof body !== 'object') return body;
+  return {
+    ...body,
+    system_fingerprint: body.system_fingerprint || systemFingerprintForModel(modelName || body.model),
+    service_tier: body.service_tier || 'default',
+  };
+}
+
 export function neutralizeCascadeIdentity(text, modelName) {
   if (!text || !modelName) return text;
   const provider = providerForModelName(modelName);
@@ -1293,6 +1308,8 @@ export async function handleChatCompletions(body, context = {}) {
         id: chatId, object: 'chat.completion', created, model: displayModel,
         choices: [{ index: 0, message, finish_reason: 'stop' }],
         usage: cachedUsage(messages, cached.text),
+        system_fingerprint: systemFingerprintForModel(displayModel),
+        service_tier: 'default',
       },
     };
   }
@@ -1707,6 +1724,8 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
         id, object: 'chat.completion', created, model,
         choices: [{ index: 0, message, finish_reason: finishReason }],
         usage,
+        system_fingerprint: systemFingerprintForModel(model),
+        service_tier: 'default',
       },
     };
   } catch (err) {
@@ -1800,7 +1819,7 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
         }
       });
       const send = (data) => {
-        if (!res.writableEnded) res.write(`data: ${JSON.stringify(data)}\n\n`);
+        if (!res.writableEnded) res.write(`data: ${JSON.stringify(decorateChatEnvelope(data, model))}\n\n`);
       };
       unregisterSse = registerSseController({
         abort(reason) {

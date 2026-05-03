@@ -330,6 +330,7 @@ async function route(req, res) {
     const reqStartedAt = Date.now();
     const result = await handleChatCompletions(body, { callerKey: callerKeyFromRequest(req, extractToken(req), body) });
     const processingMs = Date.now() - reqStartedAt;
+    const reqToken = extractToken(req);
     const modelHeaders = {
       'x-request-id': makeProviderRequestId(),
       'openai-model': body.model || '',
@@ -340,7 +341,7 @@ async function route(req, res) {
       // OpenAI always returns an organization header. We don't have a real
       // org id, but a stable synthetic one keeps the shape consistent so
       // the signature check doesn't pick up on the missing field.
-      'openai-organization': 'org-windsurf-proxy',
+      'openai-organization': makeSyntheticOrgId(reqToken),
     };
     if (result.stream) {
       res.writeHead(result.status, { 'Access-Control-Allow-Origin': '*', ...modelHeaders, ...result.headers });
@@ -373,12 +374,13 @@ async function route(req, res) {
     const reqStartedAt = Date.now();
     const result = await handleResponses(body, { context: { callerKey: callerKeyFromRequest(req, extractToken(req), body) } });
     const processingMs = Date.now() - reqStartedAt;
+    const reqToken = extractToken(req);
     const modelHeaders = {
-      'x-request-id': 'req-' + randomUUID(),
+      'x-request-id': makeProviderRequestId(),
       'openai-model': body.model || '',
       'openai-processing-ms': String(processingMs),
       'openai-version': '2020-10-01',
-      'openai-organization': 'org-windsurf-proxy',
+      'openai-organization': makeSyntheticOrgId(reqToken),
     };
     if (result.stream) {
       res.writeHead(result.status, { 'Access-Control-Allow-Origin': '*', ...modelHeaders, ...result.headers });
