@@ -38,9 +38,11 @@ export const MODELS = {
   'claude-opus-4-7-low':            { name: 'claude-opus-4-7-low',            provider: 'anthropic', enumValue: 0,   modelUid: 'claude-opus-4-7-low', credit: 6 },
   'claude-opus-4-7-high':           { name: 'claude-opus-4-7-high',           provider: 'anthropic', enumValue: 0,   modelUid: 'claude-opus-4-7-high', credit: 10 },
   'claude-opus-4-7-xhigh':          { name: 'claude-opus-4-7-xhigh',          provider: 'anthropic', enumValue: 0,   modelUid: 'claude-opus-4-7-xhigh', credit: 12 },
+  'claude-opus-4-7-max':            { name: 'claude-opus-4-7-max',            provider: 'anthropic', enumValue: 0,   modelUid: 'claude-opus-4-7-xhigh', credit: 12 },
   'claude-opus-4-7-medium-thinking': { name: 'claude-opus-4-7-medium-thinking', provider: 'anthropic', enumValue: 0, modelUid: 'claude-opus-4-7-medium-thinking', credit: 10 },
   'claude-opus-4-7-high-thinking':  { name: 'claude-opus-4-7-high-thinking',  provider: 'anthropic', enumValue: 0,   modelUid: 'claude-opus-4-7-high-thinking', credit: 12 },
   'claude-opus-4-7-xhigh-thinking': { name: 'claude-opus-4-7-xhigh-thinking', provider: 'anthropic', enumValue: 0,   modelUid: 'claude-opus-4-7-xhigh-thinking', credit: 16 },
+  'claude-opus-4-7-max-thinking':   { name: 'claude-opus-4-7-max-thinking',   provider: 'anthropic', enumValue: 0,   modelUid: 'claude-opus-4-7-xhigh-thinking', credit: 16 },
 
   // ── GPT ─────────────────────────────────────────────────
   'gpt-4o':                         { name: 'gpt-4o',                         provider: 'openai', enumValue: 109, modelUid: 'MODEL_CHAT_GPT_4O_2024_08_06', credit: 1 },
@@ -253,9 +255,11 @@ const ANTHROPIC_DATED = {
   'claude-opus-4.7-medium':     'claude-opus-4-7-medium',
   'claude-opus-4.7-high':       'claude-opus-4-7-high',
   'claude-opus-4.7-xhigh':      'claude-opus-4-7-xhigh',
+  'claude-opus-4.7-max':        'claude-opus-4-7-max',
   'claude-opus-4.7-medium-thinking': 'claude-opus-4-7-medium-thinking',
   'claude-opus-4.7-high-thinking':   'claude-opus-4-7-high-thinking',
   'claude-opus-4.7-xhigh-thinking':  'claude-opus-4-7-xhigh-thinking',
+  'claude-opus-4.7-max-thinking':    'claude-opus-4-7-max-thinking',
 };
 for (const [k, v] of Object.entries(ANTHROPIC_DATED)) _lookup.set(k, v);
 
@@ -283,7 +287,9 @@ const CURSOR_ALIASES = {
   'opus-4.7-thinking':     'claude-opus-4-7-medium-thinking',
   'opus-4-7':              'claude-opus-4-7-medium',
   'opus-4.7':              'claude-opus-4-7-medium',
+  'opus-4.7-max':          'claude-opus-4-7-max',
   'o4.7':                  'claude-opus-4-7-medium',
+  'o4.7-max':              'claude-opus-4-7-max',
   // sonnet
   'sonnet-4.6':            'claude-sonnet-4.6',
   'sonnet-4.6-thinking':   'claude-sonnet-4.6-thinking',

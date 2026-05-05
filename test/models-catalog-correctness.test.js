@@ -11,6 +11,8 @@ describe('v2.0.29 model catalog correctness', () => {
   it('maps opus-4.7 shorthand aliases to canonical 4.7 medium keys', () => {
     assert.equal(resolveModel('opus-4.7'), 'claude-opus-4-7-medium');
     assert.equal(resolveModel('o4.7'), 'claude-opus-4-7-medium');
+    assert.equal(resolveModel('opus-4.7-max'), 'claude-opus-4-7-max');
+    assert.equal(resolveModel('o4.7-max'), 'claude-opus-4-7-max');
     assert.equal(resolveModel('claude-opus-4.7'), 'claude-opus-4-7-medium');
   });
 
@@ -18,6 +20,14 @@ describe('v2.0.29 model catalog correctness', () => {
     assert.equal(resolveModel('opus-4.7-thinking'), 'claude-opus-4-7-medium-thinking');
     assert.equal(resolveModel('claude-opus-4.7-thinking'), 'claude-opus-4-7-medium-thinking');
     assert.equal(resolveModel('claude-opus-4.7-high-thinking'), 'claude-opus-4-7-high-thinking');
+    assert.equal(resolveModel('claude-opus-4.7-max-thinking'), 'claude-opus-4-7-max-thinking');
+  });
+
+  it('keeps public Opus 4.7 max alias display-stable while routing to xhigh UID', () => {
+    const info = getModelInfo(resolveModel('claude-opus-4-7-max'));
+    assert.equal(info?.name, 'claude-opus-4-7-max');
+    assert.equal(info?.modelUid, 'claude-opus-4-7-xhigh');
+    assert.equal(info?.credit, 12);
   });
 
   it('keeps new v2.0.29 model metadata aligned with declared keys', () => {

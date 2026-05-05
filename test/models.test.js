@@ -52,6 +52,8 @@ describe('resolveModel Opus 4.7 / legacy alias coverage', () => {
     assert.equal(resolveModel('claude-opus-4.7'), 'claude-opus-4-7-medium');
     assert.equal(resolveModel('claude-opus-4.7-thinking'), 'claude-opus-4-7-medium-thinking');
     assert.equal(resolveModel('claude-opus-4.7-high-thinking'), 'claude-opus-4-7-high-thinking');
+    assert.equal(resolveModel('claude-opus-4.7-max'), 'claude-opus-4-7-max');
+    assert.equal(resolveModel('claude-opus-4.7-max-thinking'), 'claude-opus-4-7-max-thinking');
     assert.equal(resolveModel('claude-Opus-4.7'), 'claude-opus-4-7-medium');
     assert.equal(resolveModel('CLAUDE-OPUS-4.7'), 'claude-opus-4-7-medium');
     assert.equal(resolveModel('claude.opus.4.7'), 'claude.opus.4.7');
@@ -60,7 +62,7 @@ describe('resolveModel Opus 4.7 / legacy alias coverage', () => {
   it('documents unsupported bare / separator variants explicitly', () => {
     // Underscores aren't a recognized separator
     assert.equal(resolveModel('claude_opus_4_7'), 'claude_opus_4_7');
-    // Bare `opus-4.7-xhigh` (no `claude-` prefix on a tier-suffix variant) — not aliased
+    // Bare `opus-4.7-xhigh` (no `claude-` prefix on this tier-suffix variant) — not aliased
     assert.equal(resolveModel('opus-4.7-xhigh'), 'opus-4.7-xhigh');
     // Too bare to disambiguate (sonnet vs opus)
     assert.equal(resolveModel('4.7-medium'), '4.7-medium');
