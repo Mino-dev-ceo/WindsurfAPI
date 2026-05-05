@@ -28,7 +28,12 @@ let _bindHost = '0.0.0.0';
 
 // Per-tier requests-per-minute limits. Used for both filter-by-cap and
 // weighted selection (accounts with more headroom are preferred).
-const TIER_RPM = { pro: 60, free: 10, unknown: 20, expired: 0 };
+const TIER_RPM = {
+  pro: positiveIntEnv('WINDSURFAPI_PRO_RPM', 60),
+  free: positiveIntEnv('WINDSURFAPI_FREE_RPM', 10),
+  unknown: positiveIntEnv('WINDSURFAPI_UNKNOWN_RPM', 20),
+  expired: 0,
+};
 const RPM_WINDOW_MS = 60 * 1000;
 
 // Monotonic per-process counter so two reservations landing in the same

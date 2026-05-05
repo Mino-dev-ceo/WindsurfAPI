@@ -27,9 +27,14 @@ import { sanitizeText, sanitizeToolCall, PathSanitizeStream } from '../sanitize.
 import { registerSseController } from '../sse-registry.js';
 import { humanizeModelName, providerForModelName } from '../model-identity.js';
 
+function positiveIntEnv(name, fallback) {
+  const n = parseInt(process.env[name] || '', 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
 const HEARTBEAT_MS = 15_000;
-const QUEUE_RETRY_MS = 1_000;
-const QUEUE_MAX_WAIT_MS = 30_000;
+const QUEUE_RETRY_MS = positiveIntEnv('WINDSURFAPI_ACCOUNT_QUEUE_RETRY_MS', 1_000);
+const QUEUE_MAX_WAIT_MS = positiveIntEnv('WINDSURFAPI_ACCOUNT_QUEUE_MAX_WAIT_MS', 30_000);
 
 // Build the option bag the v2.0.25 semantic key needs. tools / tool_choice /
 // preamble are baked into the digest so a tool schema change misses instead
