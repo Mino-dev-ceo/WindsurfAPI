@@ -8,7 +8,7 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   getAccountList, getAccountCount, addAccountByKey, addAccountByToken,
-  removeAccount, setAccountStatus, resetAccountErrors, updateAccountLabel,
+  removeAccount, removeExpiredAccounts, setAccountStatus, resetAccountErrors, updateAccountLabel,
   isAuthenticated, probeAccount, ensureLsForAccount,
   refreshCredits, refreshAllCredits,
   setAccountBlockedModels, setAccountTokens, setAccountTier,
@@ -331,6 +331,12 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
   // ─── Accounts ─────────────────────────────────────────
   if (subpath === '/accounts' && method === 'GET') {
     return json(res, 200, { accounts: getAccountList() });
+  }
+
+  // DELETE /accounts/expired — bulk remove accounts explicitly probed as expired
+  if (subpath === '/accounts/expired' && method === 'DELETE') {
+    const removed = removeExpiredAccounts();
+    return json(res, 200, { success: true, removed, removedCount: removed.length, ...getAccountCount() });
   }
 
   if (subpath === '/accounts' && method === 'POST') {

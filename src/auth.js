@@ -501,6 +501,25 @@ export function removeAccount(id) {
   return true;
 }
 
+function removeAccountsByPredicate(predicate, reason) {
+  const removed = [];
+  for (let i = accounts.length - 1; i >= 0; i--) {
+    const account = accounts[i];
+    if (!predicate(account)) continue;
+    accounts.splice(i, 1);
+    removed.push({ id: account.id, email: account.email, tier: account.tier || 'unknown' });
+    import('./conversation-pool.js').then(m => m.invalidateFor({ apiKey: account.apiKey })).catch(() => {});
+  }
+  if (!removed.length) return removed;
+  saveAccounts();
+  log.info(`Bulk removed ${removed.length} account(s)${reason ? ` (${reason})` : ''}: ${removed.map(a => `${a.id}(${a.email})`).join(', ')}`);
+  return removed.reverse();
+}
+
+export function removeExpiredAccounts() {
+  return removeAccountsByPredicate(a => (a.tier || 'unknown') === 'expired', 'tier=expired');
+}
+
 // ─── Account selection (tier-weighted RPM) ─────────────────
 
 /**

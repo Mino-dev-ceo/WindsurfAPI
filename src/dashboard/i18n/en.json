@@ -79,6 +79,7 @@
     "cancel": "Cancel",
     "confirm": "Confirm",
     "delete": "Delete",
+    "deleteExpired": "Delete expired",
     "refresh": "Refresh",
     "probe": "Probe",
     "probeTitle": "Probe capabilities",
@@ -615,6 +616,11 @@
       "title": "Delete Account",
       "desc": "This action cannot be undone. Delete this account?"
     },
+    "deleteExpired": {
+      "title": "Delete {{count}} expired account(s)",
+      "desc": "This will bulk delete every account whose tier is Expired. This action cannot be undone. Continue?",
+      "more": "{{count}} more account(s)..."
+    },
     "resetStats": {
       "title": "Reset Statistics",
       "desc": "Clear all statistics data?"
@@ -712,6 +718,9 @@
   "account": {
     "addSuccess": "Account added",
     "deleteSuccess": "Account deleted",
+    "deleteExpiredNone": "No expired accounts right now",
+    "deleteExpiredSuccess": "Deleted {{count}} expired account(s)",
+    "deleteExpiredFailed": "Failed to delete expired accounts",
     "enableSuccess": "Account enabled",
     "disableSuccess": "Account disabled",
     "resetErrors": "Errors reset",

@@ -6,6 +6,8 @@ import {
   configureBindHost,
   getAccountList,
   removeAccount,
+  removeExpiredAccounts,
+  setAccountTier,
   shouldEmitNoAuthWarning,
   validateApiKey,
 } from '../src/auth.js';
@@ -69,5 +71,22 @@ describe('shouldEmitNoAuthWarning', () => {
     assert.equal(listed.apiKey, undefined);
     assert.equal(listed.apiKey_masked, `${key.slice(0, 8)}...${key.slice(-4)}`);
     assert.equal(listed.keyPrefix, 'abcd1234...');
+  });
+
+  it('bulk removes only expired accounts', () => {
+    const expired = addAccountByKey(`expired-key-${Date.now()}`, 'expired-account');
+    const active = addAccountByKey(`active-key-${Date.now()}`, 'active-account');
+    createdAccountIds.push(expired.id, active.id);
+
+    setAccountTier(expired.id, 'expired');
+    setAccountTier(active.id, 'pro');
+
+    const removed = removeExpiredAccounts();
+    assert.deepEqual(removed.map(a => a.id), [expired.id]);
+    assert.equal(getAccountList().some(a => a.id === expired.id), false);
+    assert.equal(getAccountList().some(a => a.id === active.id), true);
+
+    const idx = createdAccountIds.indexOf(expired.id);
+    if (idx !== -1) createdAccountIds.splice(idx, 1);
   });
 });
