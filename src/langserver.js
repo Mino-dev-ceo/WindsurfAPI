@@ -335,6 +335,11 @@ export async function ensureLs(proxy = null, ownerKey = null) {
       // trio only runs once per LS lifetime instead of once per request.
       workspaceInit: null,
       sessionId: null,
+      // Shared-LS mode still needs account-local Cascade panel state. The
+      // Windsurf backend binds workspace trust to the metadata apiKey +
+      // session_id pair, so reusing one session across accounts can surface
+      // as "untrusted workspace".
+      accountSessions: new Map(),
     };
     _pool.set(key, entry);
 
@@ -407,6 +412,26 @@ export function getLsEntryByPort(port) {
     if (entry.port === port) return entry;
   }
   return null;
+}
+
+/**
+ * Return the account-scoped Cascade state for a shared LS port.
+ *
+ * LS processes are shared per proxy by default, but Cascade panel/workspace
+ * trust must be initialized separately per account. Keeping this state under
+ * the LS entry lets one process serve many accounts without cross-account
+ * session reuse.
+ */
+export function getLsAccountStateByPort(port, apiKey) {
+  const entry = getLsEntryByPort(port);
+  if (!entry || !apiKey) return null;
+  if (!entry.accountSessions) entry.accountSessions = new Map();
+  let state = entry.accountSessions.get(apiKey);
+  if (!state) {
+    state = { workspaceInit: null, sessionId: null };
+    entry.accountSessions.set(apiKey, state);
+  }
+  return state;
 }
 
 /**

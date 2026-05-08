@@ -16,7 +16,7 @@ import { log } from './config.js';
 import { extractImages } from './image.js';
 import { humanizeModelName, providerForModelName } from './model-identity.js';
 import { closeSessionForPort, grpcFrame, grpcUnary, grpcStream } from './grpc.js';
-import { getLsEntryByPort } from './langserver.js';
+import { getLsAccountStateByPort, getLsEntryByPort } from './langserver.js';
 import {
   buildRawGetChatMessageRequest, parseRawResponse,
   buildInitializePanelStateRequest,
@@ -54,6 +54,12 @@ function resetCascadeTransportState(port) {
   if (!lsEntry) return;
   lsEntry.workspaceInit = null;
   lsEntry.sessionId = null;
+  if (lsEntry.accountSessions) {
+    for (const state of lsEntry.accountSessions.values()) {
+      state.workspaceInit = null;
+      state.sessionId = null;
+    }
+  }
 }
 
 function isImageLikeBlock(part) {
@@ -268,11 +274,11 @@ export class WindsurfClient {
     // mint a fresh UUID on every call. A stable session per LS matches
     // what a real Windsurf IDE instance sends (one session for the whole
     // window's lifetime) and gives upstream fingerprinting less to latch
-    // onto. Cascade path already does this via lsEntry.sessionId; this
+    // onto. Cascade path already does this via account-scoped LS state; this
     // closes the same gap for the legacy channel.
-    const lsEntry = getLsEntryByPort(this.port);
-    if (lsEntry && !lsEntry.sessionId) lsEntry.sessionId = randomUUID();
-    const sessionId = lsEntry?.sessionId;
+    const lsState = getLsAccountStateByPort(this.port, this.apiKey);
+    if (lsState && !lsState.sessionId) lsState.sessionId = randomUUID();
+    const sessionId = lsState?.sessionId;
     const proto = buildRawGetChatMessageRequest(this.apiKey, messages, modelEnum, modelName, sessionId);
     const body = grpcFrame(proto);
 
@@ -332,16 +338,16 @@ export class WindsurfClient {
    * so the first real chat request skips these 3 gRPC round-trips.
    */
   warmupCascade(force = false) {
-    const lsEntry = getLsEntryByPort(this.port);
-    if (!lsEntry) return Promise.resolve();
+    const lsState = getLsAccountStateByPort(this.port, this.apiKey);
+    if (!lsState) return Promise.resolve();
     if (force) {
-      lsEntry.workspaceInit = null;
-      lsEntry.sessionId = randomUUID();
+      lsState.workspaceInit = null;
+      lsState.sessionId = randomUUID();
     }
-    if (!lsEntry.sessionId) lsEntry.sessionId = randomUUID();
-    if (lsEntry.workspaceInit) return lsEntry.workspaceInit;
+    if (!lsState.sessionId) lsState.sessionId = randomUUID();
+    if (lsState.workspaceInit) return lsState.workspaceInit;
 
-    const sessionId = lsEntry.sessionId;
+    const sessionId = lsState.sessionId;
     const wsId = this.apiKey.slice(0, 8).replace(/[^a-z0-9]/gi, 'x');
     const workspacePath = join(workspaceBaseDir(), `account-${wsId}`);
     const workspaceUri = `file://${workspacePath}`;
@@ -353,7 +359,7 @@ export class WindsurfClient {
       throw markCascadeTransportError(new Error(`${stage}: ${err.message}`));
     };
 
-    lsEntry.workspaceInit = (async () => {
+    lsState.workspaceInit = (async () => {
       try {
         const initProto = buildInitializePanelStateRequest(this.apiKey, sessionId);
         await grpcUnary(this.port, this.csrfToken,
@@ -377,10 +383,10 @@ export class WindsurfClient {
       } catch (e) { handleWarmupError('Heartbeat', e); }
       log.info(`Cascade workspace init complete for LS port=${this.port}`);
     })().catch(e => {
-      lsEntry.workspaceInit = null;
+      lsState.workspaceInit = null;
       throw e;
     });
-    return lsEntry.workspaceInit;
+    return lsState.workspaceInit;
   }
 
   // ─── Cascade flow ────────────────────────────────────────
@@ -404,11 +410,11 @@ export class WindsurfClient {
 
     log.debug(`CascadeChat: uid=${modelUid} enum=${modelEnum} msgs=${messages.length} reuse=${!!reuseEntry}`);
 
-    // One-shot per-LS workspace init (idempotent; typically pre-warmed at
-    // LS startup). Falls back to a local session id if the LS entry is gone.
-    const lsEntry = getLsEntryByPort(this.port);
+    // One-shot per-account workspace init on the shared LS. Falls back to a
+    // local session id if the LS entry is gone.
+    const lsState = getLsAccountStateByPort(this.port, this.apiKey);
     await this.warmupCascade();
-    let sessionId = reuseEntry?.sessionId || lsEntry?.sessionId || randomUUID();
+    let sessionId = reuseEntry?.sessionId || lsState?.sessionId || randomUUID();
 
     // "panel state not found" means the LS forgot the panel for our sessionId
     // (LS restarted, TTL expired, etc.). Re-run warmupCascade with a fresh
@@ -443,7 +449,7 @@ export class WindsurfClient {
         if (!isPanelMissing(e)) throw e;
         log.warn(`Panel state missing, re-warming LS port=${this.port}`);
         await this.warmupCascade(true);
-        sessionId = getLsEntryByPort(this.port)?.sessionId || randomUUID();
+        sessionId = getLsAccountStateByPort(this.port, this.apiKey)?.sessionId || randomUUID();
         reuseEntry = null; // cascade expired — treat as fresh
         cascadeId = await openCascade();
       }
@@ -627,7 +633,7 @@ export class WindsurfClient {
           }
           // Small backoff — LS panel state sometimes needs a moment after Init
           if (panelRetry > 1) await new Promise(r => setTimeout(r, 250 * panelRetry));
-          sessionId = getLsEntryByPort(this.port)?.sessionId || randomUUID();
+          sessionId = getLsAccountStateByPort(this.port, this.apiKey)?.sessionId || randomUUID();
           const startProto = buildStartCascadeRequest(this.apiKey, sessionId);
           const startResp = await grpcUnary(
             this.port, this.csrfToken, `${LS_SERVICE}/StartCascade`, grpcFrame(startProto)
@@ -997,7 +1003,7 @@ export class WindsurfClient {
       // v2.0.25 LOW-1: stamp the LS generation onto the cascade meta so the
       // pool entry can be invalidated cleanly if this LS restarts and a
       // different LS later lands on the same port.
-      chunks.lsGeneration = lsEntry?.generation || null;
+      chunks.lsGeneration = getLsEntryByPort(this.port)?.generation || null;
       // v2.0.25 LOW-2: surface history coverage so the pool entry can
       // record whether truncation happened on the fresh-cascade path.
       chunks.historyCoverage = historyCoverage;
@@ -1070,9 +1076,9 @@ export class WindsurfClient {
       `${LS_SERVICE}/GetUserStatus`, grpcFrame(proto), 10000,
     );
     const userStatusBytes = extractUserStatusBytes(resp);
-    const lsEntry = getLsEntryByPort(this.port);
-    if (lsEntry && !lsEntry.sessionId) lsEntry.sessionId = randomUUID();
-    const sessionId = lsEntry?.sessionId || null;
+    const lsState = getLsAccountStateByPort(this.port, this.apiKey);
+    if (lsState && !lsState.sessionId) lsState.sessionId = randomUUID();
+    const sessionId = lsState?.sessionId || null;
     const panelProto = buildUpdatePanelStateWithUserStatusRequest(this.apiKey, sessionId, userStatusBytes);
     grpcUnary(
       this.port, this.csrfToken,
