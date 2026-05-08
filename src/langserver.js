@@ -1,12 +1,10 @@
 /**
  * Language server pool manager.
  * Spawns multiple LS instances — one per unique outbound proxy (plus a default
- * no-proxy instance) by default, or one per account when the caller passes an
- * owner key. Accounts are routed to the LS instance matching their configured
- * proxy/account so that each upstream Codeium request goes out through the
- * right egress IP. Also avoids the LS state-pollution bug where switching
- * accounts within a single LS session causes workspace trust/setup state to
- * bleed across identities.
+ * no-proxy instance) by default. This keeps memory bounded when operators load
+ * large account pools: accounts that share an egress proxy also share the same
+ * local language-server process. Set WINDSURFAPI_PER_ACCOUNT_LS=1 to restore
+ * the old isolation mode where every account gets its own LS process.
  */
 
 import { spawn } from 'child_process';
@@ -24,6 +22,7 @@ const DEFAULT_PORT = 42100;
 const DEFAULT_CSRF = 'windsurf-api-csrf-fixed-token';
 const DEFAULT_API_URL = 'https://server.self-serve.windsurf.com';
 const DEFAULT_DATA_ROOT = '/opt/windsurf/data';
+const PER_ACCOUNT_LS = process.env.WINDSURFAPI_PER_ACCOUNT_LS === '1';
 
 // Pool: key -> { process, port, csrfToken, proxy, startedAt, ready }
 const _pool = new Map();
@@ -47,9 +46,13 @@ function proxyKey(proxy) {
 
 function lsPoolKey(proxy, ownerKey = null) {
   const base = proxyKey(proxy);
-  if (!ownerKey) return base;
+  if (!PER_ACCOUNT_LS || !ownerKey) return base;
   const safeOwner = String(ownerKey).replace(/[^a-zA-Z0-9]/g, '_');
   return `${base}__acct_${safeOwner}`;
+}
+
+export function isPerAccountLanguageServerMode() {
+  return PER_ACCOUNT_LS;
 }
 
 function dataDirForKey(key) {
@@ -187,8 +190,8 @@ async function waitPortReady(port, timeoutMs = 20000) {
 
 /**
  * Spawn an LS instance for the given proxy (or no-proxy default).
- * When `ownerKey` is provided, the LS is pinned to that account instead of
- * being shared across accounts on the same proxy.
+ * By default, `ownerKey` is ignored so accounts share one LS per proxy.
+ * With WINDSURFAPI_PER_ACCOUNT_LS=1, `ownerKey` pins the LS to that account.
  * Idempotent — returns the existing entry if one is already running.
  */
 export async function ensureLs(proxy = null, ownerKey = null) {

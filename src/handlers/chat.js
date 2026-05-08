@@ -35,6 +35,8 @@ function positiveIntEnv(name, fallback) {
 const HEARTBEAT_MS = 15_000;
 const QUEUE_RETRY_MS = positiveIntEnv('WINDSURFAPI_ACCOUNT_QUEUE_RETRY_MS', 1_000);
 const QUEUE_MAX_WAIT_MS = positiveIntEnv('WINDSURFAPI_ACCOUNT_QUEUE_MAX_WAIT_MS', 30_000);
+const MAX_ACCOUNT_ATTEMPTS = positiveIntEnv('WINDSURFAPI_MAX_ACCOUNT_ATTEMPTS', 0);
+const SMART_ACCOUNT_FAILOVER = process.env.WINDSURFAPI_SMART_LOAD_BALANCE !== '0';
 
 // Build the option bag the v2.0.25 semantic key needs. tools / tool_choice /
 // preamble are baked into the digest so a tool schema change misses instead
@@ -92,6 +94,21 @@ function upstreamTransientErrorMessage(model, triedCount, reason = 'internal_err
 
 export function isUpstreamTransientError(err, isInternal = false) {
   return !!err && (isInternal || err.kind === 'transient_stall' || isCascadeTransportError(err));
+}
+
+export function smartAccountAttemptLimit(activeCount, configuredLimit = MAX_ACCOUNT_ATTEMPTS) {
+  const poolSize = Math.max(0, Number(activeCount) || 0);
+  const fullPoolLimit = Math.max(3, poolSize);
+  const explicitLimit = Math.max(0, Number(configuredLimit) || 0);
+  return explicitLimit > 0 ? Math.min(fullPoolLimit, Math.max(3, explicitLimit)) : fullPoolLimit;
+}
+
+function currentAccountAttemptLimit() {
+  return smartAccountAttemptLimit(getAccountList().filter(a => a.status === 'active').length);
+}
+
+export function shouldFailoverStrictReuse({ strictReuse, hadSuccess = false, enabled = SMART_ACCOUNT_FAILOVER } = {}) {
+  return !!enabled && !!strictReuse && !hadSuccess;
 }
 
 function shortHash(text) {
@@ -1430,12 +1447,10 @@ export async function handleChatCompletions(body, context = {}) {
   // upstream_transient_error instead of the misleading "rate limit"
   // message the all-accounts-exhausted branch would otherwise produce.
   let internalCount = 0;
-  // Dynamic: try every active account in the pool (capped at 10) so a
-  // large pool with many rate-limited accounts can still fall through
-  // to a free one. Was hardcoded 3 — in pools bigger than 3 with the
-  // first accounts rate-limited, healthy accounts were never reached
-  // even though they would have worked (issue #5).
-  const maxAttempts = Math.min(10, Math.max(3, getAccountList().filter(a => a.status === 'active').length));
+  // Dynamic: try every active account in the pool by default so a large
+  // pool with many rate-limited accounts can still fall through to a free
+  // one. Operators can cap the scan with WINDSURFAPI_MAX_ACCOUNT_ATTEMPTS.
+  const maxAttempts = currentAccountAttemptLimit();
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     let acct = null;
     if (reuseEntry && attempt === 0) {
@@ -1452,20 +1467,29 @@ export async function handleChatCompletions(body, context = {}) {
           log.info(`Chat[${reqId}]: reuse MISS — owning account not available after 5s wait`);
           if (strictReuse && checkedOutReuseEntry && fpBefore) {
             const availability = getAccountAvailability(checkedOutReuseEntry.apiKey, routingModelKey);
-            const retryAfterMs = strictReuseRetryMs(availability);
-            poolCheckin(fpBefore, checkedOutReuseEntry, callerKey, ttlHintFromCachePolicy(cachePolicy));
-            log.info(`Chat[${reqId}]: strict reuse preserved cascade; owner unavailable reason=${availability.reason}`);
-            return {
-              status: 429,
-              headers: { 'Retry-After': String(Math.ceil(retryAfterMs / 1000)) },
-              body: {
-                error: {
-                  message: strictReuseMessage(displayModel, retryAfterMs, availability.reason),
-                  type: 'rate_limit_exceeded',
-                  retry_after_ms: retryAfterMs,
+            if (shouldFailoverStrictReuse({ strictReuse })) {
+              if (checkedOutReuseEntry.apiKey && !tried.includes(checkedOutReuseEntry.apiKey)) {
+                tried.push(checkedOutReuseEntry.apiKey);
+              }
+              log.info(`Chat[${reqId}]: strict reuse failover enabled; dropping pinned cascade (${availability.reason}) and trying next account`);
+              checkedOutReuseEntry = null;
+              reuseEntry = null;
+            } else {
+              const retryAfterMs = strictReuseRetryMs(availability);
+              poolCheckin(fpBefore, checkedOutReuseEntry, callerKey, ttlHintFromCachePolicy(cachePolicy));
+              log.info(`Chat[${reqId}]: strict reuse preserved cascade; owner unavailable reason=${availability.reason}`);
+              return {
+                status: 429,
+                headers: { 'Retry-After': String(Math.ceil(retryAfterMs / 1000)) },
+                body: {
+                  error: {
+                    message: strictReuseMessage(displayModel, retryAfterMs, availability.reason),
+                    type: 'rate_limit_exceeded',
+                    retry_after_ms: retryAfterMs,
+                  },
                 },
-              },
-            };
+              };
+            }
           }
           reuseEntry = null;
         }
@@ -1511,6 +1535,12 @@ export async function handleChatCompletions(body, context = {}) {
           }
           if (!reuseEntryDead && strictReuse && checkedOutReuseEntry && fpBefore && checkedOutReuseEntry.apiKey === acct.apiKey) {
             const availability = getAccountAvailability(acct.apiKey, routingModelKey);
+            if (shouldFailoverStrictReuse({ strictReuse })) {
+              log.info(`Chat[${reqId}]: strict reuse failover enabled after preflight limit (${availability.reason}); trying next account`);
+              checkedOutReuseEntry = null;
+              reuseEntry = null;
+              continue;
+            }
             const retryAfterMs = strictReuseRetryMs(availability);
             poolCheckin(fpBefore, checkedOutReuseEntry, callerKey, ttlHintFromCachePolicy(cachePolicy));
             log.info(`Chat[${reqId}]: strict reuse preserved cascade after preflight rate limit`);
@@ -1574,6 +1604,12 @@ export async function handleChatCompletions(body, context = {}) {
     if (errType === 'rate_limit_exceeded') {
       if (!reuseEntryDead && strictReuse && checkedOutReuseEntry && fpBefore && checkedOutReuseEntry.apiKey === acct.apiKey) {
         const availability = getAccountAvailability(acct.apiKey, routingModelKey);
+        if (shouldFailoverStrictReuse({ strictReuse })) {
+          log.info(`Chat[${reqId}]: strict reuse failover enabled after rate limit (${availability.reason}); trying next account`);
+          checkedOutReuseEntry = null;
+          reuseEntry = null;
+          continue;
+        }
         const retryAfterMs = strictReuseRetryMs(availability);
         poolCheckin(fpBefore, checkedOutReuseEntry, callerKey, ttlHintFromCachePolicy(cachePolicy));
         log.info(`Chat[${reqId}]: strict reuse preserved cascade after rate limit`);
@@ -1967,12 +2003,10 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
       // between accounts and (b) surface upstream_transient_error when
       // every attempt hit it.
       let streamInternalCount = 0;
-      // Dynamic: try every active account in the pool (capped at 10) so a
-  // large pool with many rate-limited accounts can still fall through
-  // to a free one. Was hardcoded 3 — in pools bigger than 3 with the
-  // first accounts rate-limited, healthy accounts were never reached
-  // even though they would have worked (issue #5).
-  const maxAttempts = Math.min(10, Math.max(3, getAccountList().filter(a => a.status === 'active').length));
+      // Dynamic: try every active account in the pool by default so a large
+      // pool with many rate-limited accounts can still fall through to a free
+      // one. Operators can cap the scan with WINDSURFAPI_MAX_ACCOUNT_ATTEMPTS.
+      const maxAttempts = currentAccountAttemptLimit();
 
       // Accumulate chunks so we can cache a successful response at the end.
       let accText = '';
@@ -2132,13 +2166,22 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
                 log.info(`Chat[${reqId}]: reuse MISS — owning account not available after 5s wait`);
                 if (strictReuse && checkedOutReuseEntry && fpBefore) {
                   const availability = getAccountAvailability(checkedOutReuseEntry.apiKey, modelKey);
-                  const retryAfterMs = strictReuseRetryMs(availability);
-                  lastErr = Object.assign(
-                    new Error(strictReuseMessage(model, retryAfterMs, availability.reason)),
-                    { type: 'rate_limit_exceeded' }
-                  );
-                  log.info(`Chat[${reqId}]: strict reuse preserved cascade; owner unavailable reason=${availability.reason}`);
-                  break;
+                  if (shouldFailoverStrictReuse({ strictReuse, hadSuccess })) {
+                    if (checkedOutReuseEntry.apiKey && !tried.includes(checkedOutReuseEntry.apiKey)) {
+                      tried.push(checkedOutReuseEntry.apiKey);
+                    }
+                    log.info(`Chat[${reqId}]: strict reuse failover enabled; dropping pinned cascade (${availability.reason}) and trying next account`);
+                    checkedOutReuseEntry = null;
+                    reuseEntry = null;
+                  } else {
+                    const retryAfterMs = strictReuseRetryMs(availability);
+                    lastErr = Object.assign(
+                      new Error(strictReuseMessage(model, retryAfterMs, availability.reason)),
+                      { type: 'rate_limit_exceeded' }
+                    );
+                    log.info(`Chat[${reqId}]: strict reuse preserved cascade; owner unavailable reason=${availability.reason}`);
+                    break;
+                  }
                 }
                 reuseEntry = null;
               }
@@ -2186,6 +2229,12 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
                 }
                 if (!reuseEntryDead && strictReuse && checkedOutReuseEntry && fpBefore && checkedOutReuseEntry.apiKey === acct.apiKey) {
                   const availability = getAccountAvailability(acct.apiKey, modelKey);
+                  if (shouldFailoverStrictReuse({ strictReuse, hadSuccess })) {
+                    log.info(`Chat[${reqId}]: strict reuse failover enabled after preflight limit (${availability.reason}); trying next account`);
+                    checkedOutReuseEntry = null;
+                    reuseEntry = null;
+                    continue;
+                  }
                   const retryAfterMs = strictReuseRetryMs(availability);
                   lastErr = Object.assign(
                     new Error(strictReuseMessage(model, retryAfterMs, availability.reason)),
@@ -2355,8 +2404,15 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
               updateCapability(currentApiKey, modelKey, false, 'model_error');
             }
             if (isRateLimit && strictReuse && checkedOutReuseEntry && fpBefore && checkedOutReuseEntry.apiKey === currentApiKey) {
-              log.info(`Chat[${reqId}]: strict reuse preserved cascade after rate limit`);
-              break;
+              if (shouldFailoverStrictReuse({ strictReuse, hadSuccess })) {
+                const availability = getAccountAvailability(currentApiKey, modelKey);
+                log.info(`Chat[${reqId}]: strict reuse failover enabled after rate limit (${availability.reason}); trying next account`);
+                checkedOutReuseEntry = null;
+                reuseEntry = null;
+              } else {
+                log.info(`Chat[${reqId}]: strict reuse preserved cascade after rate limit`);
+                break;
+              }
             }
             // Retry only if nothing has been streamed yet AND it's a retryable error
             if (!hadSuccess && (err.isModelError || isRateLimit)) {

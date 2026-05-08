@@ -1397,8 +1397,9 @@ export async function initAuth() {
     refreshAllFirebaseTokens().catch(e => log.warn(`Scheduled token refresh: ${e.message}`));
   }, TOKEN_REFRESH_INTERVAL).unref?.();
 
-  // Warm up an LS instance for each account so workspace trust/session state
-  // stays isolated across identities even when they share the same proxy.
+  // Warm up LS instances so the first request doesn't pay startup latency.
+  // In shared-LS mode this collapses to one instance per proxy; with
+  // WINDSURFAPI_PER_ACCOUNT_LS=1 it falls back to the old per-account shape.
   const { ensureLs } = await import('./langserver.js');
   for (const a of accounts) {
     const p = getEffectiveProxy(a.id);
