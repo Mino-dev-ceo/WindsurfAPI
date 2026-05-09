@@ -3,8 +3,10 @@
  * Spawns multiple LS instances — one per unique outbound proxy (plus a default
  * no-proxy instance) by default. This keeps memory bounded when operators load
  * large account pools: accounts that share an egress proxy also share the same
- * local language-server process. Set WINDSURFAPI_PER_ACCOUNT_LS=1 to restore
- * the old isolation mode where every account gets its own LS process.
+ * local language-server process. Set WINDSURFAPI_LS_ACCOUNT_GROUP_SIZE=N to
+ * split accounts on the same proxy into N-account LS groups, or
+ * WINDSURFAPI_PER_ACCOUNT_LS=1 to restore the old isolation mode where every
+ * account gets its own LS process.
  */
 
 import { spawn } from 'child_process';
@@ -23,6 +25,7 @@ const DEFAULT_CSRF = 'windsurf-api-csrf-fixed-token';
 const DEFAULT_API_URL = 'https://server.self-serve.windsurf.com';
 const DEFAULT_DATA_ROOT = '/opt/windsurf/data';
 const PER_ACCOUNT_LS = process.env.WINDSURFAPI_PER_ACCOUNT_LS === '1';
+const ACCOUNT_GROUP_SIZE = positiveIntEnv('WINDSURFAPI_LS_ACCOUNT_GROUP_SIZE', 0);
 
 // Pool: key -> { process, port, csrfToken, proxy, startedAt, ready }
 const _pool = new Map();
@@ -33,6 +36,11 @@ const _pending = new Map();
 let _nextPort = DEFAULT_PORT + 1;
 let _binaryPath = DEFAULT_BINARY;
 let _apiServerUrl = DEFAULT_API_URL;
+
+function positiveIntEnv(name, fallback) {
+  const n = parseInt(process.env[name] || '', 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
 
 function proxyKey(proxy) {
   if (!proxy || !proxy.host) return 'default';
@@ -46,13 +54,22 @@ function proxyKey(proxy) {
 
 function lsPoolKey(proxy, ownerKey = null) {
   const base = proxyKey(proxy);
-  if (!PER_ACCOUNT_LS || !ownerKey) return base;
+  const ownerScoped = PER_ACCOUNT_LS || ACCOUNT_GROUP_SIZE > 0;
+  if (!ownerScoped || !ownerKey) return base;
+  // In grouped mode, group_0 reuses the base key/port so existing small
+  // deployments keep their familiar default LS instance at 42100.
+  if (ACCOUNT_GROUP_SIZE > 0 && String(ownerKey) === 'group_0') return base;
   const safeOwner = String(ownerKey).replace(/[^a-zA-Z0-9]/g, '_');
-  return `${base}__acct_${safeOwner}`;
+  const scope = ACCOUNT_GROUP_SIZE > 0 && String(ownerKey).startsWith('group_') ? 'grp' : 'acct';
+  return `${base}__${scope}_${safeOwner}`;
 }
 
 export function isPerAccountLanguageServerMode() {
   return PER_ACCOUNT_LS;
+}
+
+export function getLanguageServerAccountGroupSize() {
+  return ACCOUNT_GROUP_SIZE;
 }
 
 function dataDirForKey(key) {
@@ -191,7 +208,9 @@ async function waitPortReady(port, timeoutMs = 20000) {
 /**
  * Spawn an LS instance for the given proxy (or no-proxy default).
  * By default, `ownerKey` is ignored so accounts share one LS per proxy.
- * With WINDSURFAPI_PER_ACCOUNT_LS=1, `ownerKey` pins the LS to that account.
+ * With WINDSURFAPI_LS_ACCOUNT_GROUP_SIZE=N, callers pass a group ownerKey so
+ * each proxy gets one LS per N accounts. With WINDSURFAPI_PER_ACCOUNT_LS=1,
+ * `ownerKey` pins the LS to that account.
  * Idempotent — returns the existing entry if one is already running.
  */
 export async function ensureLs(proxy = null, ownerKey = null) {
@@ -513,6 +532,8 @@ export function getLsStatus() {
     port: def?.port || DEFAULT_PORT,
     startedAt: def?.startedAt || null,
     restartCount: 0,
+    accountGroupSize: ACCOUNT_GROUP_SIZE,
+    perAccount: PER_ACCOUNT_LS,
     instances: Array.from(_pool.entries()).map(([key, e]) => ({
       key, port: e.port,
       pid: e.process?.pid || null,

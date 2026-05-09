@@ -255,9 +255,9 @@
     },
     "lsPool": {
       "title": "Language Server Pool",
-      "desc": "{{count}} LS instances · one process per dedicated proxy",
+      "desc": "{{count}} LS instances · shared by proxy/account groups",
       "sectionTitle": "Language Server Pool",
-      "sectionDesc": "Dedicated Language Server instances per proxy",
+      "sectionDesc": "Language Server instances shared by proxy/account groups",
       "port": "Port",
       "defaultInstance": "Default Instance",
       "noProxy": "No proxy"

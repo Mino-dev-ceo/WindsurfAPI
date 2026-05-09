@@ -35,6 +35,7 @@ const TIER_RPM = {
   expired: 0,
 };
 const RPM_WINDOW_MS = 60 * 1000;
+const LS_ACCOUNT_GROUP_SIZE = positiveIntEnv('WINDSURFAPI_LS_ACCOUNT_GROUP_SIZE', 0);
 
 // Monotonic per-process counter so two reservations landing in the same
 // millisecond produce distinct `_rpmHistory` tokens. Without this,
@@ -59,6 +60,43 @@ function positiveIntEnv(name, fallback) {
 
 function rpmLimitFor(account) {
   return TIER_RPM[account.tier || 'unknown'] ?? 20;
+}
+
+function proxyIdentityForAccount(accountId) {
+  const proxy = getEffectiveProxy(accountId);
+  if (!proxy || !proxy.host) return 'default';
+  return [
+    proxy.host,
+    String(proxy.port || 8080),
+    proxy.username || '',
+  ].join(':');
+}
+
+/**
+ * Return the owner key used to select an LS instance for an account.
+ *
+ * Default behaviour stays unchanged: one LS per proxy because langserver.js
+ * ignores ownerKey unless an owner-scoped mode is enabled. When
+ * WINDSURFAPI_LS_ACCOUNT_GROUP_SIZE=N is set, accounts sharing the same proxy
+ * are chunked in stable account-list order into group_0, group_1, ...
+ */
+export function getLsOwnerKeyForAccount(accountId) {
+  if (!accountId) return null;
+  if (LS_ACCOUNT_GROUP_SIZE <= 0) return accountId;
+  const account = accounts.find(a => a.id === accountId);
+  if (!account) return accountId;
+  const proxyIdentity = proxyIdentityForAccount(account.id);
+  const peers = accounts
+    .filter(a => proxyIdentityForAccount(a.id) === proxyIdentity)
+    .sort((a, b) => {
+      const ta = Number(a.addedAt || 0);
+      const tb = Number(b.addedAt || 0);
+      if (ta !== tb) return ta - tb;
+      return String(a.id || '').localeCompare(String(b.id || ''));
+    });
+  const idx = peers.findIndex(a => a.id === account.id);
+  const groupIndex = Math.floor(Math.max(0, idx) / LS_ACCOUNT_GROUP_SIZE);
+  return `group_${groupIndex}`;
 }
 
 function pruneRpmHistory(account, now) {
@@ -679,8 +717,9 @@ export async function ensureLsForAccount(accountId) {
   const { ensureLs } = await import('./langserver.js');
   const account = accounts.find(a => a.id === accountId);
   const proxy = getEffectiveProxy(accountId) || null;
+  const ownerKey = getLsOwnerKeyForAccount(accountId);
   try {
-    const ls = await ensureLs(proxy, accountId);
+    const ls = await ensureLs(proxy, ownerKey);
     // Pre-warm the Cascade workspace init so the first real request on this
     // LS doesn't pay the 3-roundtrip setup cost. Fire-and-forget — chat
     // requests still await the same Promise if it hasn't finished yet.
@@ -1018,8 +1057,9 @@ export async function fetchUserStatus(id) {
   const { WindsurfClient } = await import('./client.js');
   const { ensureLs, getLsFor } = await import('./langserver.js');
   const proxy = getEffectiveProxy(account.id) || null;
-  await ensureLs(proxy, account.id);
-  const ls = getLsFor(proxy, account.id);
+  const ownerKey = getLsOwnerKeyForAccount(account.id);
+  await ensureLs(proxy, ownerKey);
+  const ls = getLsFor(proxy, ownerKey);
   if (!ls) { log.warn(`No LS for GetUserStatus on ${account.id}`); return null; }
 
   const client = new WindsurfClient(account.apiKey, ls.port, ls.csrfToken);
@@ -1139,8 +1179,9 @@ async function _probeAccountImpl(account) {
   const { ensureLs, getLsFor } = await import('./langserver.js');
 
   const proxy = getEffectiveProxy(account.id) || null;
-  await ensureLs(proxy, account.id);
-  const ls = getLsFor(proxy, account.id);
+  const ownerKey = getLsOwnerKeyForAccount(account.id);
+  await ensureLs(proxy, ownerKey);
+  const ls = getLsFor(proxy, ownerKey);
   if (!ls) { log.error(`No LS available for account ${account.id}`); return null; }
   const port = ls.port;
   const csrf = ls.csrfToken;
@@ -1398,12 +1439,14 @@ export async function initAuth() {
   }, TOKEN_REFRESH_INTERVAL).unref?.();
 
   // Warm up LS instances so the first request doesn't pay startup latency.
-  // In shared-LS mode this collapses to one instance per proxy; with
-  // WINDSURFAPI_PER_ACCOUNT_LS=1 it falls back to the old per-account shape.
+  // In shared-LS mode this collapses to one instance per proxy. With
+  // WINDSURFAPI_LS_ACCOUNT_GROUP_SIZE=N, accounts sharing a proxy are split
+  // into N-account LS groups. WINDSURFAPI_PER_ACCOUNT_LS=1 keeps the old
+  // per-account shape when no group size is set.
   const { ensureLs } = await import('./langserver.js');
   for (const a of accounts) {
     const p = getEffectiveProxy(a.id);
-    try { await ensureLs(p, a.id); }
+    try { await ensureLs(p, getLsOwnerKeyForAccount(a.id)); }
     catch (e) { log.warn(`LS warmup failed: ${e.message}`); }
   }
 

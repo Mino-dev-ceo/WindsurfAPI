@@ -5,7 +5,7 @@
 
 import { createHash, randomUUID } from 'crypto';
 import { WindsurfClient, contentToString, isCascadeTransportError } from '../client.js';
-import { getApiKey, acquireAccountByKey, releaseAccount, getAccountAvailability, reportError, reportSuccess, markRateLimited, reportInternalError, updateCapability, getAccountList, isAllRateLimited, isAllTemporarilyUnavailable, refundReservation } from '../auth.js';
+import { getApiKey, acquireAccountByKey, releaseAccount, getAccountAvailability, reportError, reportSuccess, markRateLimited, reportInternalError, updateCapability, getAccountList, getLsOwnerKeyForAccount, isAllRateLimited, isAllTemporarilyUnavailable, refundReservation } from '../auth.js';
 import { resolveModel, getModelInfo } from '../models.js';
 import { getLsFor, ensureLs } from '../langserver.js';
 import { config, log } from '../config.js';
@@ -1564,8 +1564,9 @@ export async function handleChatCompletions(body, context = {}) {
       }
     }
 
-    await ensureLs(acct.proxy, acct.id);
-    const ls = getLsFor(acct.proxy, acct.id);
+    const lsOwnerKey = getLsOwnerKeyForAccount(acct.id);
+    await ensureLs(acct.proxy, lsOwnerKey);
+    const ls = getLsFor(acct.proxy, lsOwnerKey);
     if (!ls) { lastErr = { status: 503, body: { error: { message: 'No LS instance available', type: 'ls_unavailable' } } }; break; }
     // Cascade pins cascade_id to a specific LS port too; if the LS it was
     // born on has been replaced, the cascade_id is dead.
@@ -2250,8 +2251,9 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
             }
           }
 
-          try { await ensureLs(acct.proxy, acct.id); } catch (e) { lastErr = e; break; }
-          const ls = getLsFor(acct.proxy, acct.id);
+          const lsOwnerKey = getLsOwnerKeyForAccount(acct.id);
+          try { await ensureLs(acct.proxy, lsOwnerKey); } catch (e) { lastErr = e; break; }
+          const ls = getLsFor(acct.proxy, lsOwnerKey);
           if (!ls) { lastErr = new Error('No LS instance available'); break; }
           if (reuseEntry && reuseEntry.lsPort !== ls.port) {
             log.info(`Chat[${reqId}]: reuse MISS — LS port changed`);

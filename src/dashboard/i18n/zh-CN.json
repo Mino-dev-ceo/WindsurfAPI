@@ -255,9 +255,9 @@
     },
     "lsPool": {
       "title": "语言服务器池",
-      "desc": "{{count}} 个 LS 实例 · 每个独立代理对应一个进程",
+      "desc": "{{count}} 个 LS 实例 · 按代理/账号分组共享进程",
       "sectionTitle": "语言服务器池",
-      "sectionDesc": "{{count}} 个 LS 实例 · 每个独立代理对应一个进程",
+      "sectionDesc": "{{count}} 个 LS 实例 · 按代理/账号分组共享进程",
       "port": "端口",
       "defaultInstance": "默认实例",
       "noProxy": "无代理"
