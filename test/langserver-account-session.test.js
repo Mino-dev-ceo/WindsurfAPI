@@ -15,10 +15,9 @@ describe('shared LS account session isolation', () => {
     assert.match(CLIENT_JS, /lsState\.sessionId/);
   });
 
-  it('shares one tracked workspace per LS to avoid exhausting LS workspace slots', () => {
-    assert.match(CLIENT_JS, /function workspacePathForLs\(\)/);
-    assert.match(CLIENT_JS, /join\(workspaceBaseDir\(\), 'default'\)/);
-    assert.doesNotMatch(CLIENT_JS, /function workspaceIdForAccount\(apiKey\)/);
+  it('derives per-account workspace paths from full-key hashes', () => {
+    assert.match(CLIENT_JS, /function workspaceIdForAccount\(apiKey\)/);
+    assert.match(CLIENT_JS, /createHash\('sha256'\)\.update\(String\(apiKey \|\| ''\)\)/);
     assert.doesNotMatch(CLIENT_JS, /const wsId = this\.apiKey\.slice\(0, 8\)/);
   });
 });

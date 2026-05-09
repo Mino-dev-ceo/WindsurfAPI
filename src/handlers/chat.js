@@ -36,7 +36,6 @@ const HEARTBEAT_MS = 15_000;
 const QUEUE_RETRY_MS = positiveIntEnv('WINDSURFAPI_ACCOUNT_QUEUE_RETRY_MS', 1_000);
 const QUEUE_MAX_WAIT_MS = positiveIntEnv('WINDSURFAPI_ACCOUNT_QUEUE_MAX_WAIT_MS', 30_000);
 const MAX_ACCOUNT_ATTEMPTS = positiveIntEnv('WINDSURFAPI_MAX_ACCOUNT_ATTEMPTS', 0);
-const DEFAULT_ACCOUNT_ATTEMPTS = positiveIntEnv('WINDSURFAPI_DEFAULT_ACCOUNT_ATTEMPTS', 8);
 const SMART_ACCOUNT_FAILOVER = process.env.WINDSURFAPI_SMART_LOAD_BALANCE !== '0';
 
 // Build the option bag the v2.0.25 semantic key needs. tools / tool_choice /
@@ -97,13 +96,11 @@ export function isUpstreamTransientError(err, isInternal = false) {
   return !!err && (isInternal || err.kind === 'transient_stall' || isCascadeTransportError(err));
 }
 
-export function smartAccountAttemptLimit(activeCount, configuredLimit = MAX_ACCOUNT_ATTEMPTS, defaultLimit = DEFAULT_ACCOUNT_ATTEMPTS) {
+export function smartAccountAttemptLimit(activeCount, configuredLimit = MAX_ACCOUNT_ATTEMPTS) {
   const poolSize = Math.max(0, Number(activeCount) || 0);
-  if (poolSize === 0) return 0;
+  const fullPoolLimit = Math.max(3, poolSize);
   const explicitLimit = Math.max(0, Number(configuredLimit) || 0);
-  const fallbackLimit = Math.max(1, Number(defaultLimit) || 1);
-  const desiredLimit = explicitLimit > 0 ? explicitLimit : fallbackLimit;
-  return Math.min(poolSize, Math.max(1, desiredLimit));
+  return explicitLimit > 0 ? Math.min(fullPoolLimit, Math.max(3, explicitLimit)) : fullPoolLimit;
 }
 
 function currentAccountAttemptLimit() {
@@ -1450,9 +1447,9 @@ export async function handleChatCompletions(body, context = {}) {
   // upstream_transient_error instead of the misleading "rate limit"
   // message the all-accounts-exhausted branch would otherwise produce.
   let internalCount = 0;
-  // Try a bounded slice of the pool by default. A full-pool scan can turn one
-  // upstream model outage into dozens of freshly rate-limited accounts.
-  // Operators can override with WINDSURFAPI_MAX_ACCOUNT_ATTEMPTS.
+  // Dynamic: try every active account in the pool by default so a large
+  // pool with many rate-limited accounts can still fall through to a free
+  // one. Operators can cap the scan with WINDSURFAPI_MAX_ACCOUNT_ATTEMPTS.
   const maxAttempts = currentAccountAttemptLimit();
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     let acct = null;
@@ -2006,9 +2003,9 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
       // between accounts and (b) surface upstream_transient_error when
       // every attempt hit it.
       let streamInternalCount = 0;
-      // Same bounded failover as the non-stream path: avoid sweeping an entire
-      // account pool when the upstream model is returning rate limits.
-      // Operators can override with WINDSURFAPI_MAX_ACCOUNT_ATTEMPTS.
+      // Dynamic: try every active account in the pool by default so a large
+      // pool with many rate-limited accounts can still fall through to a free
+      // one. Operators can cap the scan with WINDSURFAPI_MAX_ACCOUNT_ATTEMPTS.
       const maxAttempts = currentAccountAttemptLimit();
 
       // Accumulate chunks so we can cache a successful response at the end.
