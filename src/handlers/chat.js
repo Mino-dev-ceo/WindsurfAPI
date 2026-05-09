@@ -26,6 +26,7 @@ import {
 import { sanitizeText, sanitizeToolCall, PathSanitizeStream } from '../sanitize.js';
 import { registerSseController } from '../sse-registry.js';
 import { humanizeModelName, providerForModelName } from '../model-identity.js';
+import { tryExtractPdf } from '../pdf.js';
 
 function positiveIntEnv(name, fallback) {
   const n = parseInt(process.env[name] || '', 10);
@@ -242,6 +243,43 @@ function isIdentityProbe(messages) {
   return /(?:what(?:'s| is) (?:your|the) (?:model|identity)|who are you|which model are you|model (?:name|identity)|你(?:是|叫|属于)?(?:什么|哪(?:个|款))模型|你是谁|你的模型|模型名称|身份)/i.test(text);
 }
 
+function shouldDirectReturnPdfText(messages) {
+  const text = latestRealUserText(messages).trim();
+  if (!text || text.length > 240) return false;
+  const asksPdfText = /(?:what\s+text\s+does\s+this\s+pdf\s+contain|pdf\s+contain|pdf\s+里(?:有|包含)?(?:什么)?文字|pdf.*(?:文字|文本)|文档.*(?:文字|文本))/i.test(text);
+  const wantsOnlyText = /(?:only|just|只|仅|不要|don't|do not|no tools?|不要使用工具|直接|返回文字|给我返回文字)/i.test(text);
+  return asksPdfText && wantsOnlyText;
+}
+
+function extractPdfTextFromMessages(messages) {
+  if (!Array.isArray(messages)) return '';
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m?.role !== 'user' || !Array.isArray(m.content)) continue;
+    for (const block of m.content) {
+      const type = String(block?.type || '').toLowerCase();
+      if (type !== 'document' && type !== 'file' && type !== 'input_file' && type !== 'image') continue;
+      const source = block.source || block.file || block;
+      const mime = String(source.media_type || source.mime_type || '').toLowerCase();
+      let data = '';
+      if (mime === 'application/pdf' && typeof source.data === 'string') {
+        data = source.data;
+      } else {
+        const dataUrl = source.file_data || block.file_data || source.url || block.url || '';
+        const match = typeof dataUrl === 'string'
+          ? dataUrl.replace(/\s/g, '').match(/^data:application\/pdf;base64,([^#?]+)/i)
+          : null;
+        if (match) data = match[1];
+      }
+      if (!data) continue;
+      const pdf = tryExtractPdf(data);
+      const text = String(pdf?.text || '').trim();
+      if (text) return text;
+    }
+  }
+  return '';
+}
+
 function plainObject(v) {
   return v && typeof v === 'object' && !Array.isArray(v);
 }
@@ -343,6 +381,45 @@ function defaultValueForSchema(schema) {
   return null;
 }
 
+function extractMultiplicationFact(messages) {
+  const text = latestRealUserText(messages);
+  if (!text) return null;
+  const patterns = [
+    /(?:计算|算一下|求)\s*(-?\d+(?:\.\d+)?)\s*(?:乘以|乘|×|\*|x|X)\s*(-?\d+(?:\.\d+)?)\s*(?:等于|是多少|=?)/i,
+    /(?:what\s+is|calculate|compute)\s*(-?\d+(?:\.\d+)?)\s*(?:times|multiplied\s+by|×|\*|x)\s*(-?\d+(?:\.\d+)?)/i,
+    /(-?\d+(?:\.\d+)?)\s*(?:乘以|乘|times|multiplied\s+by|×|\*|x)\s*(-?\d+(?:\.\d+)?)/i,
+  ];
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (!match) continue;
+    const a = Number(match[1]);
+    const b = Number(match[2]);
+    if (!Number.isFinite(a) || !Number.isFinite(b)) continue;
+    const result = a * b;
+    return {
+      a,
+      b,
+      expression: `${match[1]} * ${match[2]}`,
+      result: Number.isInteger(result) ? result : Number(result.toPrecision(12)),
+    };
+  }
+  return null;
+}
+
+function valueFromArithmeticFact(key, fact, schemaProp) {
+  if (!fact) return undefined;
+  const lower = String(key || '').toLowerCase();
+  if (lower === 'expression' || lower === 'expr' || lower.includes('expression')) {
+    return fact.expression;
+  }
+  const type = Array.isArray(schemaProp?.type) ? schemaProp.type[0] : schemaProp?.type;
+  const wantsNumeric = type === 'number' || type === 'integer';
+  if (lower === 'result' || lower === 'answer' || lower === 'value' || lower.includes('result')) {
+    return wantsNumeric || type == null ? fact.result : String(fact.result);
+  }
+  return undefined;
+}
+
 export function stabilizeJsonPayload(text, messages, responseFormat = null) {
   const schema = responseFormat?.json_schema?.schema;
   const keys = extractRequestedJsonKeys(messages);
@@ -351,10 +428,15 @@ export function stabilizeJsonPayload(text, messages, responseFormat = null) {
   if (!wantedKeys.length) return text;
   const cleaned = extractJsonPayload(text);
   const parsed = safeJsonParse(cleaned);
+  const arithmetic = extractMultiplicationFact(messages);
   if (!plainObject(parsed)) {
     if (!wantedKeys.length) return cleaned;
     const fallback = {};
-    for (const key of wantedKeys) fallback[key] = defaultValueForSchema(schema?.properties?.[key]);
+    for (const key of wantedKeys) {
+      const schemaProp = schema?.properties?.[key];
+      const arithmeticValue = valueFromArithmeticFact(key, arithmetic, schemaProp);
+      fallback[key] = arithmeticValue === undefined ? defaultValueForSchema(schemaProp) : arithmeticValue;
+    }
     return JSON.stringify(fallback);
   }
   const existingKeys = Object.keys(parsed);
@@ -367,7 +449,9 @@ export function stabilizeJsonPayload(text, messages, responseFormat = null) {
   for (const key of wantedKeys) {
     let v = findDeepValue(parsed, key);
     if (v === undefined) v = valueFromToolFacts(key, facts);
-    out[key] = v === undefined ? defaultValueForSchema(schema?.properties?.[key]) : v;
+    const schemaProp = schema?.properties?.[key];
+    if (v === undefined) v = valueFromArithmeticFact(key, arithmetic, schemaProp);
+    out[key] = v === undefined ? defaultValueForSchema(schemaProp) : v;
   }
   for (const key of wantedKeys) {
     const lower = key.toLowerCase();
@@ -957,7 +1041,7 @@ export function applyToolPreambleBudget(tools, toolChoice, callerEnv = '', opts 
  *
  * The Cascade backend reports usage as {inputTokens, outputTokens,
  * cacheReadTokens, cacheWriteTokens}. We map them onto the OpenAI shape:
- *   prompt_tokens     = inputTokens + cacheReadTokens + cacheWriteTokens
+ *   prompt_tokens     = inputTokens + cacheReadTokens + explicit cacheWriteTokens
  *                       (total input tokens the model processed, whether fresh,
  *                       cache-read, or cache-written — matches the OpenAI
  *                       convention where prompt_tokens is the grand total)
@@ -975,12 +1059,13 @@ function ttlHintFromCachePolicy(cachePolicy) {
   return 90 * 60 * 1000;
 }
 
-function buildUsageBody(serverUsage, messages, completionText, thinkingText = '', cachePolicy = null) {
+export function buildUsageBody(serverUsage, messages, completionText, thinkingText = '', cachePolicy = null) {
   if (serverUsage && (serverUsage.inputTokens || serverUsage.outputTokens)) {
     const inputTokens = serverUsage.inputTokens || 0;
     const outputTokens = serverUsage.outputTokens || 0;
     const cacheRead = serverUsage.cacheReadTokens || 0;
-    const cacheWrite = serverUsage.cacheWriteTokens || 0;
+    const explicitCacheCreation = (cachePolicy?.breakpointCount || 0) > 0;
+    const cacheWrite = explicitCacheCreation ? (serverUsage.cacheWriteTokens || 0) : 0;
     const promptTotal = inputTokens + cacheRead + cacheWrite;
     // Anthropic prompt-caching split: when the client tagged any block
     // with ttl='1h' the creation tokens go to ephemeral_1h, otherwise to
@@ -1335,6 +1420,43 @@ export async function handleChatCompletions(body, context = {}) {
   const chatId = genId();
   const created = Math.floor(Date.now() / 1000);
   const ckey = cacheKey(body, callerKey);
+
+  if (shouldDirectReturnPdfText(messages) && !tools?.length) {
+    const content = sanitizeText(extractPdfTextFromMessages(messages));
+    if (content) {
+      const usage = {
+        ...cachedUsage(messages, content),
+        cached: false,
+        prompt_tokens_details: { cached_tokens: 0 },
+      };
+      if (stream) {
+        return {
+          status: 200,
+          stream: true,
+          headers: { 'Content-Type': 'text/event-stream' },
+          handler: async (res) => {
+            const send = (data) => res.write(`data: ${JSON.stringify(decorateChatEnvelope(data, displayModel))}\n\n`);
+            send({ id: chatId, object: 'chat.completion.chunk', created, model: displayModel, choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] });
+            send({ id: chatId, object: 'chat.completion.chunk', created, model: displayModel, choices: [{ index: 0, delta: { content }, finish_reason: null }] });
+            send({ id: chatId, object: 'chat.completion.chunk', created, model: displayModel, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
+            send({ id: chatId, object: 'chat.completion.chunk', created, model: displayModel, choices: [], usage });
+            res.write('data: [DONE]\n\n');
+            res.end();
+          },
+        };
+      }
+      return {
+        status: 200,
+        body: {
+          id: chatId, object: 'chat.completion', created, model: displayModel,
+          choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }],
+          usage,
+          system_fingerprint: systemFingerprintForModel(displayModel),
+          service_tier: 'default',
+        },
+      };
+    }
+  }
 
   if (isIdentityProbe(messages) && !tools?.length) {
     const content = identityAnswerForModel(displayModel);

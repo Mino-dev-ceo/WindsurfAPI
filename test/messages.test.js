@@ -1,7 +1,7 @@
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { annotateRiskyReadToolResult, extractCallerSubKey, handleMessages } from '../src/handlers/messages.js';
-import { applyJsonResponseHint, extractRequestedJsonKeys, handleChatCompletions, isExplicitJsonRequested, stabilizeJsonPayload } from '../src/handlers/chat.js';
+import { applyJsonResponseHint, buildUsageBody, extractRequestedJsonKeys, handleChatCompletions, isExplicitJsonRequested, stabilizeJsonPayload } from '../src/handlers/chat.js';
 import { addAccountByKey, removeAccount, setAccountTier } from '../src/auth.js';
 
 function chatChunk(chunk) {
@@ -44,6 +44,38 @@ function parseAnthropicEvents(raw) {
         data: JSON.parse(lines.find(line => line.startsWith('data: '))?.slice(6) || '{}'),
       };
     });
+}
+
+function makeSimplePdfBase64(text) {
+  const stream = `BT /F1 14 Tf 10 20 Td (${text}) Tj ET`;
+  const pdf = `%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 150 50] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>
+endobj
+4 0 obj
+<< /Length ${stream.length} >>
+stream
+${stream}
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+xref
+0 6
+0000000000 65535 f
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+0
+%%EOF`;
+  return Buffer.from(pdf, 'binary').toString('base64');
 }
 
 describe('Anthropic messages request translation', () => {
@@ -173,6 +205,45 @@ describe('Anthropic messages request translation', () => {
     assert.equal(capturedBody.messages[0].content[0].type, 'document');
     assert.equal(capturedBody.messages[0].content[0].source.url, 'https://example.com/demo.pdf');
     assert.equal(capturedBody.messages[0].content[1].type, 'text');
+  });
+
+  it('directly returns extracted PDF text for explicit PDF text probes', async () => {
+    const account = addAccountByKey(`test-pdf-${Date.now()}`, `test-pdf-${Date.now()}`);
+    setAccountTier(account.id, 'pro');
+    try {
+      const result = await handleMessages({
+        model: 'claude-opus-4-7',
+        max_tokens: 128,
+        stream: true,
+        messages: [{
+          role: 'user',
+          content: [
+            {
+              type: 'document',
+              source: {
+                type: 'base64',
+                media_type: 'application/pdf',
+                data: makeSimplePdfBase64('hvoyabcd'),
+              },
+            },
+            { type: 'text', text: 'What text does this PDF contain? 只给我返回文字,不要使用工具' },
+          ],
+        }],
+      });
+
+      assert.equal(result.status, 200);
+      assert.equal(result.stream, true);
+      const res = fakeRes();
+      await result.handler(res);
+      const events = parseAnthropicEvents(res.body);
+      const text = events
+        .filter(e => e.event === 'content_block_delta')
+        .map(e => e.data.delta?.text || '')
+        .join('');
+      assert.equal(text.trim(), 'hvoyabcd');
+    } finally {
+      removeAccount(account.id);
+    }
   });
 
   it('annotates risky Read tool_result stubs before Cascade sees them', async () => {
@@ -529,7 +600,7 @@ describe('Anthropic messages request translation', () => {
     assert.equal(capturedBody.reasoning_effort, 'high');
   });
 
-  it('emits a signature delta for thinking blocks', async () => {
+  it('does not emit synthetic signature deltas for thinking blocks', async () => {
     const result = await handleMessages({
       model: 'claude-opus-4.6',
       thinking: { type: 'adaptive' },
@@ -554,11 +625,10 @@ describe('Anthropic messages request translation', () => {
     await result.handler(res);
     const events = parseAnthropicEvents(res.body);
     const signatureDelta = events.find(e => e.event === 'content_block_delta' && e.data.delta?.type === 'signature_delta');
-    assert.ok(signatureDelta, 'expected a signature_delta event');
-    assert.match(signatureDelta.data.delta.signature, /^[A-Za-z0-9+/=]+$/);
+    assert.equal(signatureDelta, undefined);
   });
 
-  it('includes a thinking signature on non-stream responses', async () => {
+  it('does not include synthetic thinking signatures on non-stream responses', async () => {
     const result = await handleMessages({
       model: 'claude-opus-4.6',
       thinking: { type: 'adaptive' },
@@ -583,6 +653,7 @@ describe('Anthropic messages request translation', () => {
 
     assert.equal(result.status, 200);
     assert.equal(result.body.content[0].type, 'thinking');
+    assert.equal(result.body.content[0].signature, undefined);
   });
 
   it('detects explicit JSON requests without response_format', () => {
@@ -724,5 +795,45 @@ describe('Anthropic messages request translation', () => {
       stabilizeJsonPayload('```json\n{"extra":true,"score":98}\n```', [{ role: 'user', content: 'Return schema JSON.' }], responseFormat),
       '{"ok":false,"score":98,"items":[]}',
     );
+  });
+
+  it('recovers multiplication results for json_schema arithmetic probes', () => {
+    const responseFormat = {
+      type: 'json_schema',
+      json_schema: {
+        name: 'calc',
+        schema: {
+          type: 'object',
+          properties: {
+            expression: { type: 'string' },
+            result: { type: 'integer' },
+          },
+          required: ['expression', 'result'],
+          additionalProperties: false,
+        },
+      },
+    };
+
+    assert.equal(
+      stabilizeJsonPayload('The answer is 5896.', [{ role: 'user', content: '计算 67 乘以 88 等于多少' }], responseFormat),
+      '{"expression":"67 * 88","result":5896}',
+    );
+  });
+
+  it('does not expose upstream cache-write tokens as prompt cache creation without cache_control', () => {
+    const usage = buildUsageBody(
+      { inputTokens: 351, outputTokens: 15, cacheReadTokens: 0, cacheWriteTokens: 7446 },
+      [{ role: 'user', content: 'hi' }],
+      'ok',
+      '',
+      { has1h: false, breakpointCount: 0 },
+    );
+
+    assert.equal(usage.cache_creation_input_tokens, 0);
+    assert.deepEqual(usage.cache_creation, {
+      ephemeral_5m_input_tokens: 0,
+      ephemeral_1h_input_tokens: 0,
+    });
+    assert.equal(usage.prompt_tokens, 351);
   });
 });
