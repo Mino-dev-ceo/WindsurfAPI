@@ -6,9 +6,10 @@ import {
 } from '../src/handlers/chat.js';
 
 describe('smart account failover', () => {
-  it('tries the full active account pool by default', () => {
-    assert.equal(smartAccountAttemptLimit(28, 0), 28);
-    assert.equal(smartAccountAttemptLimit(1, 0), 3);
+  it('caps default failover so one request cannot burn the whole pool', () => {
+    assert.equal(smartAccountAttemptLimit(28, 0), 8);
+    assert.equal(smartAccountAttemptLimit(5, 0), 5);
+    assert.equal(smartAccountAttemptLimit(1, 0), 1);
   });
 
   it('honours an explicit attempt cap without exceeding the pool size', () => {

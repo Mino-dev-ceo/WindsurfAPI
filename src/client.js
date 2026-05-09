@@ -7,7 +7,7 @@
  */
 
 import https from 'https';
-import { createHash, randomUUID } from 'crypto';
+import { randomUUID } from 'crypto';
 import { existsSync, mkdirSync, writeFileSync } from 'fs';
 import { execSync } from 'child_process';
 import { tmpdir } from 'os';
@@ -213,8 +213,8 @@ function workspaceBaseDir() {
   }
 }
 
-function workspaceIdForAccount(apiKey) {
-  return createHash('sha256').update(String(apiKey || '')).digest('hex').slice(0, 16);
+function workspacePathForLs() {
+  return join(workspaceBaseDir(), 'default');
 }
 
 function ensureWorkspaceDir(workspacePath) {
@@ -245,6 +245,34 @@ function ensureWorkspaceDir(workspacePath) {
   } catch (e) {
     log.debug(`ensureWorkspaceDir: ${e.message}`);
   }
+}
+
+async function ensureTrackedWorkspaceForLs(lsEntry, port, csrfToken, workspacePath) {
+  if (!lsEntry) {
+    ensureWorkspaceDir(workspacePath);
+    const addWsProto = buildAddTrackedWorkspaceRequest(workspacePath);
+    await grpcUnary(port, csrfToken, `${LS_SERVICE}/AddTrackedWorkspace`, grpcFrame(addWsProto), 5000);
+    return;
+  }
+
+  if (lsEntry.trackedWorkspaceInit) return lsEntry.trackedWorkspaceInit;
+  lsEntry.trackedWorkspaceInit = (async () => {
+    ensureWorkspaceDir(workspacePath);
+    const addWsProto = buildAddTrackedWorkspaceRequest(workspacePath);
+    try {
+      await grpcUnary(port, csrfToken, `${LS_SERVICE}/AddTrackedWorkspace`, grpcFrame(addWsProto), 5000);
+    } catch (e) {
+      if (/already tracked/i.test(e?.message || '')) {
+        log.debug(`AddTrackedWorkspace already tracked for LS port=${port}`);
+        return;
+      }
+      throw e;
+    }
+  })().catch(e => {
+    lsEntry.trackedWorkspaceInit = null;
+    throw e;
+  });
+  return lsEntry.trackedWorkspaceInit;
 }
 
 // ─── WindsurfClient ────────────────────────────────────────
@@ -342,6 +370,7 @@ export class WindsurfClient {
    * so the first real chat request skips these 3 gRPC round-trips.
    */
   warmupCascade(force = false) {
+    const lsEntry = getLsEntryByPort(this.port);
     const lsState = getLsAccountStateByPort(this.port, this.apiKey);
     if (!lsState) return Promise.resolve();
     if (force) {
@@ -352,8 +381,7 @@ export class WindsurfClient {
     if (lsState.workspaceInit) return lsState.workspaceInit;
 
     const sessionId = lsState.sessionId;
-    const wsId = workspaceIdForAccount(this.apiKey);
-    const workspacePath = join(workspaceBaseDir(), `account-${wsId}`);
+    const workspacePath = workspacePathForLs();
     const workspaceUri = `file://${workspacePath}`;
 
     const handleWarmupError = (stage, err) => {
@@ -370,10 +398,7 @@ export class WindsurfClient {
           `${LS_SERVICE}/InitializeCascadePanelState`, grpcFrame(initProto), 5000);
       } catch (e) { handleWarmupError('InitializeCascadePanelState', e); }
       try {
-        ensureWorkspaceDir(workspacePath);
-        const addWsProto = buildAddTrackedWorkspaceRequest(workspacePath);
-        await grpcUnary(this.port, this.csrfToken,
-          `${LS_SERVICE}/AddTrackedWorkspace`, grpcFrame(addWsProto), 5000);
+        await ensureTrackedWorkspaceForLs(lsEntry, this.port, this.csrfToken, workspacePath);
       } catch (e) { handleWarmupError('AddTrackedWorkspace', e); }
       try {
         const trustProto = buildUpdateWorkspaceTrustRequest(this.apiKey, workspaceUri, true, sessionId);
