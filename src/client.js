@@ -7,7 +7,7 @@
  */
 
 import https from 'https';
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { existsSync, mkdirSync, writeFileSync } from 'fs';
 import { execSync } from 'child_process';
 import { tmpdir } from 'os';
@@ -213,6 +213,10 @@ function workspaceBaseDir() {
   }
 }
 
+function workspaceIdForAccount(apiKey) {
+  return createHash('sha256').update(String(apiKey || '')).digest('hex').slice(0, 16);
+}
+
 function ensureWorkspaceDir(workspacePath) {
   if (_seededWorkspaces.has(workspacePath)) return;
   try {
@@ -348,7 +352,7 @@ export class WindsurfClient {
     if (lsState.workspaceInit) return lsState.workspaceInit;
 
     const sessionId = lsState.sessionId;
-    const wsId = this.apiKey.slice(0, 8).replace(/[^a-z0-9]/gi, 'x');
+    const wsId = workspaceIdForAccount(this.apiKey);
     const workspacePath = join(workspaceBaseDir(), `account-${wsId}`);
     const workspaceUri = `file://${workspacePath}`;
 

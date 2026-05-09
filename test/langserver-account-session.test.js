@@ -14,4 +14,10 @@ describe('shared LS account session isolation', () => {
     assert.match(CLIENT_JS, /lsState\.workspaceInit/);
     assert.match(CLIENT_JS, /lsState\.sessionId/);
   });
+
+  it('derives per-account workspace paths from full-key hashes', () => {
+    assert.match(CLIENT_JS, /function workspaceIdForAccount\(apiKey\)/);
+    assert.match(CLIENT_JS, /createHash\('sha256'\)\.update\(String\(apiKey \|\| ''\)\)/);
+    assert.doesNotMatch(CLIENT_JS, /const wsId = this\.apiKey\.slice\(0, 8\)/);
+  });
 });
