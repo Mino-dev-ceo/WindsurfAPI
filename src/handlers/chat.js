@@ -1048,6 +1048,9 @@ export async function handleChatCompletions(body, context = {}) {
   const cachePolicy = body.__cachePolicy || null;
   const checkMessageRateLimitFn = context.checkMessageRateLimit || checkMessageRateLimit;
   const waitForAccountFn = context.waitForAccount || waitForAccount;
+  const ensureLsFn = context.ensureLs || ensureLs;
+  const getLsForFn = context.getLsFor || getLsFor;
+  const createClientFn = context.createClient || ((apiKey, port, csrfToken) => new WindsurfClient(apiKey, port, csrfToken));
 
   // Probe diagnostics: dump compact request shape for every call, plus a
   // tail of the last user turn. Keeps us able to see how third-party
@@ -1447,6 +1450,20 @@ export async function handleChatCompletions(body, context = {}) {
   // upstream_transient_error instead of the misleading "rate limit"
   // message the all-accounts-exhausted branch would otherwise produce.
   let internalCount = 0;
+  // Dashboard stats are per logical request, not per account attempt. A request
+  // that succeeds after failover must be one success and zero errors.
+  const requestStartTime = Date.now();
+  let lastAttemptApiKey = null;
+  let finalFailureRecorded = false;
+  const recordFinalFailure = (accountId = lastAttemptApiKey) => {
+    if (finalFailureRecorded) return;
+    finalFailureRecorded = true;
+    recordRequest(displayModel, false, Date.now() - requestStartTime, accountId || null);
+  };
+  const returnFinalFailure = (result, accountId = lastAttemptApiKey) => {
+    recordFinalFailure(accountId);
+    return result;
+  };
   // Dynamic: try every active account in the pool by default so a large
   // pool with many rate-limited accounts can still fall through to a free
   // one. Operators can cap the scan with WINDSURFAPI_MAX_ACCOUNT_ATTEMPTS.
@@ -1478,7 +1495,7 @@ export async function handleChatCompletions(body, context = {}) {
               const retryAfterMs = strictReuseRetryMs(availability);
               poolCheckin(fpBefore, checkedOutReuseEntry, callerKey, ttlHintFromCachePolicy(cachePolicy));
               log.info(`Chat[${reqId}]: strict reuse preserved cascade; owner unavailable reason=${availability.reason}`);
-              return {
+              return returnFinalFailure({
                 status: 429,
                 headers: { 'Retry-After': String(Math.ceil(retryAfterMs / 1000)) },
                 body: {
@@ -1488,7 +1505,7 @@ export async function handleChatCompletions(body, context = {}) {
                     retry_after_ms: retryAfterMs,
                   },
                 },
-              };
+              }, checkedOutReuseEntry.apiKey);
             }
           }
           reuseEntry = null;
@@ -1519,129 +1536,130 @@ export async function handleChatCompletions(body, context = {}) {
       }
     }
     tried.push(acct.apiKey);
+    lastAttemptApiKey = acct.apiKey;
 
     try {
-    // Pre-flight rate limit check (experimental): ask server.codeium.com if
-    // this account still has message capacity before burning an LS round trip.
-    if (isExperimentalEnabled('preflightRateLimit')) {
-      try {
-        const px = getEffectiveProxy(acct.id) || null;
-        const rl = await checkMessageRateLimitFn(acct.apiKey, px);
-        if (!rl.hasCapacity) {
-          log.warn(`Preflight: ${acct.email} has no capacity (remaining=${rl.messagesRemaining}), skipping`);
-          refundReservation(acct.apiKey, acct.reservationTimestamp);
-          if (Number.isFinite(rl.retryAfterMs) && rl.retryAfterMs > 0) {
-            markRateLimited(acct.apiKey, rl.retryAfterMs, routingModelKey);
-          }
-          if (!reuseEntryDead && strictReuse && checkedOutReuseEntry && fpBefore && checkedOutReuseEntry.apiKey === acct.apiKey) {
-            const availability = getAccountAvailability(acct.apiKey, routingModelKey);
-            if (shouldFailoverStrictReuse({ strictReuse })) {
-              log.info(`Chat[${reqId}]: strict reuse failover enabled after preflight limit (${availability.reason}); trying next account`);
-              checkedOutReuseEntry = null;
-              reuseEntry = null;
-              continue;
+      // Pre-flight rate limit check (experimental): ask server.codeium.com if
+      // this account still has message capacity before burning an LS round trip.
+      if (isExperimentalEnabled('preflightRateLimit')) {
+        try {
+          const px = getEffectiveProxy(acct.id) || null;
+          const rl = await checkMessageRateLimitFn(acct.apiKey, px);
+          if (!rl.hasCapacity) {
+            log.warn(`Preflight: ${acct.email} has no capacity (remaining=${rl.messagesRemaining}), skipping`);
+            refundReservation(acct.apiKey, acct.reservationTimestamp);
+            if (Number.isFinite(rl.retryAfterMs) && rl.retryAfterMs > 0) {
+              markRateLimited(acct.apiKey, rl.retryAfterMs, routingModelKey);
             }
-            const retryAfterMs = strictReuseRetryMs(availability);
-            poolCheckin(fpBefore, checkedOutReuseEntry, callerKey, ttlHintFromCachePolicy(cachePolicy));
-            log.info(`Chat[${reqId}]: strict reuse preserved cascade after preflight rate limit`);
-            return {
-              status: 429,
-              headers: { 'Retry-After': String(Math.ceil(retryAfterMs / 1000)) },
-              body: {
-                error: {
-                  message: strictReuseMessage(displayModel, retryAfterMs, availability.reason),
-                  type: 'rate_limit_exceeded',
-                  retry_after_ms: retryAfterMs,
+            if (!reuseEntryDead && strictReuse && checkedOutReuseEntry && fpBefore && checkedOutReuseEntry.apiKey === acct.apiKey) {
+              const availability = getAccountAvailability(acct.apiKey, routingModelKey);
+              if (shouldFailoverStrictReuse({ strictReuse })) {
+                log.info(`Chat[${reqId}]: strict reuse failover enabled after preflight limit (${availability.reason}); trying next account`);
+                checkedOutReuseEntry = null;
+                reuseEntry = null;
+                continue;
+              }
+              const retryAfterMs = strictReuseRetryMs(availability);
+              poolCheckin(fpBefore, checkedOutReuseEntry, callerKey, ttlHintFromCachePolicy(cachePolicy));
+              log.info(`Chat[${reqId}]: strict reuse preserved cascade after preflight rate limit`);
+              return returnFinalFailure({
+                status: 429,
+                headers: { 'Retry-After': String(Math.ceil(retryAfterMs / 1000)) },
+                body: {
+                  error: {
+                    message: strictReuseMessage(displayModel, retryAfterMs, availability.reason),
+                    type: 'rate_limit_exceeded',
+                    retry_after_ms: retryAfterMs,
+                  },
                 },
-              },
-            };
+              }, acct.apiKey);
+            }
+            continue;
           }
-          continue;
+        } catch (e) {
+          log.debug(`Preflight check failed for ${acct.email}: ${e.message}`);
+          // Fail open — proceed with the request
         }
-      } catch (e) {
-        log.debug(`Preflight check failed for ${acct.email}: ${e.message}`);
-        // Fail open — proceed with the request
       }
-    }
 
-    const lsOwnerKey = getLsOwnerKeyForAccount(acct.id);
-    await ensureLs(acct.proxy, lsOwnerKey);
-    const ls = getLsFor(acct.proxy, lsOwnerKey);
-    if (!ls) { lastErr = { status: 503, body: { error: { message: 'No LS instance available', type: 'ls_unavailable' } } }; break; }
-    // Cascade pins cascade_id to a specific LS port too; if the LS it was
-    // born on has been replaced, the cascade_id is dead.
-    if (reuseEntry && reuseEntry.lsPort !== ls.port) {
-      log.info(`Chat[${reqId}]: reuse MISS — LS port changed`);
-      checkedOutReuseEntry = null;
-      reuseEntry = null;
-    }
-    const _msgChars = (messages || []).reduce((n, m) => {
-      const c = m?.content;
-      return n + (typeof c === 'string' ? c.length : Array.isArray(c) ? c.reduce((k, p) => k + (typeof p?.text === 'string' ? p.text.length : 0), 0) : 0);
-    }, 0);
-    log.info(`Chat[${reqId}]: model=${displayModel} flow=${useCascade ? 'cascade' : 'legacy'} attempt=${attempt + 1} account=${acct.email} ls=${ls.port} turns=${(messages||[]).length} chars=${_msgChars}${reuseEntry ? ' reuse=1' : ''}${emulateTools ? ' tools=emu' : ''}`);
-    const client = new WindsurfClient(acct.apiKey, ls.port, ls.csrfToken);
-    const result = await nonStreamResponse(
-      client, chatId, created, displayModel, routingModelKey, messages, cascadeMessages, modelEnum, modelUid,
-      useCascade, acct.apiKey, ckey,
-      reuseEnabled ? { reuseEntry, lsPort: ls.port, apiKey: acct.apiKey, callerKey, cachePolicy, fpOpts } : null,
-      modelInfo?.provider || null,
-      emulateTools, toolPreamble, wantJson, cachePolicy, wantThinking, response_format,
-    );
-    if (result.status === 200) return result;
-    reuseEntry = null; // don't try to reuse on the retry
-    if (result.reuseEntryInvalid) reuseEntryDead = true;
-    // #101: same upstream-timeout invalidation as the stream path —
-    // see the matching catch block in streamResponse for the full
-    // rationale (cascade trajectory left half-broken, next reuse hits
-    // it and the model "loses" the prior conversation).
-    const _resultMsg = String(result.body?.error?.message || '');
-    if (/context deadline exceeded|context cancellation while reading body|client\.timeout/i.test(_resultMsg)) {
-      reuseEntryDead = true;
-    }
-    lastErr = result;
-    const errType = result.body?.error?.type;
-    // Rate limit: this account is done for this model, try the next one
-    if (errType === 'rate_limit_exceeded') {
-      if (!reuseEntryDead && strictReuse && checkedOutReuseEntry && fpBefore && checkedOutReuseEntry.apiKey === acct.apiKey) {
-        const availability = getAccountAvailability(acct.apiKey, routingModelKey);
-        if (shouldFailoverStrictReuse({ strictReuse })) {
-          log.info(`Chat[${reqId}]: strict reuse failover enabled after rate limit (${availability.reason}); trying next account`);
-          checkedOutReuseEntry = null;
-          reuseEntry = null;
-          continue;
-        }
-        const retryAfterMs = strictReuseRetryMs(availability);
-        poolCheckin(fpBefore, checkedOutReuseEntry, callerKey, ttlHintFromCachePolicy(cachePolicy));
-        log.info(`Chat[${reqId}]: strict reuse preserved cascade after rate limit`);
-        return {
-          status: 429,
-          headers: { 'Retry-After': String(Math.ceil(retryAfterMs / 1000)) },
-          body: {
-            error: {
-              message: strictReuseMessage(displayModel, retryAfterMs, availability.reason),
-              type: 'rate_limit_exceeded',
-              retry_after_ms: retryAfterMs,
-            },
-          },
-        };
+      const lsOwnerKey = getLsOwnerKeyForAccount(acct.id);
+      await ensureLsFn(acct.proxy, lsOwnerKey);
+      const ls = getLsForFn(acct.proxy, lsOwnerKey);
+      if (!ls) { lastErr = { status: 503, body: { error: { message: 'No LS instance available', type: 'ls_unavailable' } } }; break; }
+      // Cascade pins cascade_id to a specific LS port too; if the LS it was
+      // born on has been replaced, the cascade_id is dead.
+      if (reuseEntry && reuseEntry.lsPort !== ls.port) {
+        log.info(`Chat[${reqId}]: reuse MISS — LS port changed`);
+        checkedOutReuseEntry = null;
+        reuseEntry = null;
       }
-      log.warn(`Account ${acct.email} rate-limited on ${displayModel}, trying next account`);
-      continue;
-    }
-    // Cascade transient 错误通常是上游或本地 LS 短暂抖动，先退避再切账号，避免连续打爆同一热窗口。
-    if (errType === 'upstream_internal_error' || errType === 'upstream_transient_error') {
-      internalCount++;
-      const backoffMs = await internalErrorBackoff(internalCount - 1);
-      log.warn(`Chat[${reqId}]: ${acct.email} upstream transient error, waited ${backoffMs}ms before next account`);
-      continue;
-    }
-    // Model not available on this account (permission_denied, etc.)
-    if (errType === 'model_not_available') {
-      log.warn(`Account ${acct.email} cannot serve ${displayModel}, trying next account`);
-      continue;
-    }
-    break; // other errors (502, transport) — don't retry
+      const _msgChars = (messages || []).reduce((n, m) => {
+        const c = m?.content;
+        return n + (typeof c === 'string' ? c.length : Array.isArray(c) ? c.reduce((k, p) => k + (typeof p?.text === 'string' ? p.text.length : 0), 0) : 0);
+      }, 0);
+      log.info(`Chat[${reqId}]: model=${displayModel} flow=${useCascade ? 'cascade' : 'legacy'} attempt=${attempt + 1} account=${acct.email} ls=${ls.port} turns=${(messages||[]).length} chars=${_msgChars}${reuseEntry ? ' reuse=1' : ''}${emulateTools ? ' tools=emu' : ''}`);
+      const client = createClientFn(acct.apiKey, ls.port, ls.csrfToken);
+      const result = await nonStreamResponse(
+        client, chatId, created, displayModel, routingModelKey, messages, cascadeMessages, modelEnum, modelUid,
+        useCascade, acct.apiKey, ckey,
+        reuseEnabled ? { reuseEntry, lsPort: ls.port, apiKey: acct.apiKey, callerKey, cachePolicy, fpOpts } : null,
+        modelInfo?.provider || null,
+        emulateTools, toolPreamble, wantJson, cachePolicy, wantThinking, response_format,
+      );
+      if (result.status === 200) return result;
+      reuseEntry = null; // don't try to reuse on the retry
+      if (result.reuseEntryInvalid) reuseEntryDead = true;
+      // #101: same upstream-timeout invalidation as the stream path —
+      // see the matching catch block in streamResponse for the full
+      // rationale (cascade trajectory left half-broken, next reuse hits
+      // it and the model "loses" the prior conversation).
+      const _resultMsg = String(result.body?.error?.message || '');
+      if (/context deadline exceeded|context cancellation while reading body|client\.timeout/i.test(_resultMsg)) {
+        reuseEntryDead = true;
+      }
+      lastErr = result;
+      const errType = result.body?.error?.type;
+      // Rate limit: this account is done for this model, try the next one
+      if (errType === 'rate_limit_exceeded') {
+        if (!reuseEntryDead && strictReuse && checkedOutReuseEntry && fpBefore && checkedOutReuseEntry.apiKey === acct.apiKey) {
+          const availability = getAccountAvailability(acct.apiKey, routingModelKey);
+          if (shouldFailoverStrictReuse({ strictReuse })) {
+            log.info(`Chat[${reqId}]: strict reuse failover enabled after rate limit (${availability.reason}); trying next account`);
+            checkedOutReuseEntry = null;
+            reuseEntry = null;
+            continue;
+          }
+          const retryAfterMs = strictReuseRetryMs(availability);
+          poolCheckin(fpBefore, checkedOutReuseEntry, callerKey, ttlHintFromCachePolicy(cachePolicy));
+          log.info(`Chat[${reqId}]: strict reuse preserved cascade after rate limit`);
+          return returnFinalFailure({
+            status: 429,
+            headers: { 'Retry-After': String(Math.ceil(retryAfterMs / 1000)) },
+            body: {
+              error: {
+                message: strictReuseMessage(displayModel, retryAfterMs, availability.reason),
+                type: 'rate_limit_exceeded',
+                retry_after_ms: retryAfterMs,
+              },
+            },
+          }, acct.apiKey);
+        }
+        log.warn(`Account ${acct.email} rate-limited on ${displayModel}, trying next account`);
+        continue;
+      }
+      // Cascade transient 错误通常是上游或本地 LS 短暂抖动，先退避再切账号，避免连续打爆同一热窗口。
+      if (errType === 'upstream_internal_error' || errType === 'upstream_transient_error') {
+        internalCount++;
+        const backoffMs = await internalErrorBackoff(internalCount - 1);
+        log.warn(`Chat[${reqId}]: ${acct.email} upstream transient error, waited ${backoffMs}ms before next account`);
+        continue;
+      }
+      // Model not available on this account (permission_denied, etc.)
+      if (errType === 'model_not_available') {
+        log.warn(`Account ${acct.email} cannot serve ${displayModel}, trying next account`);
+        continue;
+      }
+      break; // other errors (502, transport) — don't retry
     } finally {
       // Pair every successful getApiKey/acquireAccountByKey with a release
       // so the in-flight-count based balancer in auth.js (issue #37) stays
@@ -1657,10 +1675,10 @@ export async function handleChatCompletions(body, context = {}) {
     }
     const lastIsTransport = isCascadeTransportError(lastErr);
     log.error(`Chat[${reqId}]: ${tried.length}/${tried.length} accounts hit upstream transient error — surfacing upstream_transient_error`);
-    return {
+    return returnFinalFailure({
       status: 502,
       body: { error: { message: upstreamTransientErrorMessage(displayModel, tried.length, lastIsTransport ? 'cascade_transport' : 'internal_error'), type: 'upstream_transient_error' } },
-    };
+    });
   }
   // If all accounts exhausted, check if it's because they're all rate-limited
   const temporaryUnavailable = isAllTemporarilyUnavailable(routingModelKey);
@@ -1670,7 +1688,7 @@ export async function handleChatCompletions(body, context = {}) {
       log.info(`Chat[${reqId}]: restored checked-out cascade after temporary unavailability`);
     }
     const retryAfterSec = Math.ceil(temporaryUnavailable.retryAfterMs / 1000);
-    return {
+    return returnFinalFailure({
       status: 429,
       headers: { 'Retry-After': String(retryAfterSec) },
       body: {
@@ -1680,7 +1698,7 @@ export async function handleChatCompletions(body, context = {}) {
           retry_after_ms: temporaryUnavailable.retryAfterMs,
         },
       },
-    };
+    });
   }
   if (!lastErr || lastErr.status === 429) {
     const rl = isAllRateLimited(routingModelKey);
@@ -1690,7 +1708,7 @@ export async function handleChatCompletions(body, context = {}) {
         log.info(`Chat[${reqId}]: restored checked-out cascade after rate limit`);
       }
       const retryAfterSec = Math.ceil(rl.retryAfterMs / 1000);
-      return { status: 429, headers: { 'Retry-After': String(retryAfterSec) }, body: { error: { message: `${displayModel} 所有账号均已达速率限制，请 ${retryAfterSec} 秒后重试`, type: 'rate_limit_exceeded', retry_after_ms: rl.retryAfterMs } } };
+      return returnFinalFailure({ status: 429, headers: { 'Retry-After': String(retryAfterSec) }, body: { error: { message: `${displayModel} 所有账号均已达速率限制，请 ${retryAfterSec} 秒后重试`, type: 'rate_limit_exceeded', retry_after_ms: rl.retryAfterMs } } });
     }
   }
   if (!reuseEntryDead && checkedOutReuseEntry && fpBefore) {
@@ -1699,7 +1717,7 @@ export async function handleChatCompletions(body, context = {}) {
   } else if (reuseEntryDead) {
     log.info(`Chat[${reqId}]: reuse entry was invalidated (cascade not_found upstream); not restoring to pool`);
   }
-  return lastErr || { status: 503, body: { error: { message: 'No active accounts available', type: 'pool_exhausted' } } };
+  return returnFinalFailure(lastErr || { status: 503, body: { error: { message: 'No active accounts available', type: 'pool_exhausted' } } });
 }
 
 async function nonStreamResponse(client, id, created, model, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, apiKey, ckey, poolCtx, provider, emulateTools, toolPreamble, wantJson = false, cachePolicy = null, wantThinking = false, responseFormat = null) {
@@ -1865,7 +1883,9 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
     if (err.isModelError && err.kind !== 'transient_stall' && !isRateLimit && !isInternal) {
       updateCapability(apiKey, modelKey, false, 'model_error');
     }
-    recordRequest(model, false, Date.now() - startTime, apiKey);
+    // Do not record dashboard failures here: this is only one account
+    // attempt, and a later failover attempt may still complete the request.
+    // The caller records exactly one final failure after the retry loop.
     log.error('Chat error:', err.message);
     // Rate limits → 429 with Retry-After; model errors → 403; others → 502
     if (isRateLimit) {

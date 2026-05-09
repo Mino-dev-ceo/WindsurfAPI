@@ -11,6 +11,7 @@ import {
   setAccountTier,
 } from '../src/auth.js';
 import { handleChatCompletions, rateLimitCooldownMs } from '../src/handlers/chat.js';
+import { getStats } from '../src/dashboard/stats.js';
 import { getExperimental, setExperimental } from '../src/runtime-config.js';
 
 const createdAccountIds = [];
@@ -141,5 +142,100 @@ describe('rate-limit handling', () => {
 
     assert.equal(result.status, 503);
     assert.equal(getRpmStats()[account.id].used, 0);
+  });
+
+  it('counts account failover as one success and zero errors when a later account succeeds', async () => {
+    const accounts = [
+      addTestAccount('failover-rate-limited-1'),
+      addTestAccount('failover-rate-limited-2'),
+      addTestAccount('failover-success'),
+    ];
+    const attempts = [];
+    const before = getStats();
+    const beforeModel = before.modelCounts['gemini-2.5-flash'] || { requests: 0, success: 0, errors: 0 };
+
+    const result = await handleChatCompletions({
+      model: 'gemini-2.5-flash',
+      messages: [{ role: 'user', content: `failover stats ${Date.now()}` }],
+    }, {
+      async waitForAccount(tried, signal, maxWaitMs, modelKey) {
+        return getApiKey(tried, modelKey);
+      },
+      async ensureLs() {},
+      getLsFor() {
+        return { port: 12345, csrfToken: 'csrf-token' };
+      },
+      createClient(apiKey) {
+        return {
+          async cascadeChat() {
+            attempts.push(apiKey);
+            if (apiKey !== accounts[2].apiKey) {
+              throw new Error('Reached message rate limit for this model. Please try again later. Resets in: 10m16s');
+            }
+            const chunks = [{ text: 'ok' }];
+            chunks.cascadeId = 'cascade-id';
+            chunks.sessionId = 'session-id';
+            chunks.stepOffset = 0;
+            chunks.generatorOffset = 0;
+            return chunks;
+          },
+        };
+      },
+    });
+
+    const after = getStats();
+    const afterModel = after.modelCounts['gemini-2.5-flash'];
+
+    assert.equal(result.status, 200);
+    assert.deepEqual(attempts, accounts.map(a => a.apiKey));
+    assert.equal(after.totalRequests - before.totalRequests, 1);
+    assert.equal(after.successCount - before.successCount, 1);
+    assert.equal(after.errorCount - before.errorCount, 0);
+    assert.equal(afterModel.requests - beforeModel.requests, 1);
+    assert.equal(afterModel.success - beforeModel.success, 1);
+    assert.equal(afterModel.errors - beforeModel.errors, 0);
+  });
+
+  it('counts exhausted account failover as one final error', async () => {
+    const accounts = [
+      addTestAccount('final-rate-limited-1'),
+      addTestAccount('final-rate-limited-2'),
+    ];
+    const attempts = [];
+    const before = getStats();
+    const beforeModel = before.modelCounts['gemini-2.5-flash'] || { requests: 0, success: 0, errors: 0 };
+
+    const result = await handleChatCompletions({
+      model: 'gemini-2.5-flash',
+      messages: [{ role: 'user', content: `final failover stats ${Date.now()}` }],
+    }, {
+      async waitForAccount(tried, signal, maxWaitMs, modelKey) {
+        return getApiKey(tried, modelKey);
+      },
+      async ensureLs() {},
+      getLsFor() {
+        return { port: 12345, csrfToken: 'csrf-token' };
+      },
+      createClient(apiKey) {
+        return {
+          async cascadeChat() {
+            attempts.push(apiKey);
+            throw new Error('Reached message rate limit for this model. Please try again later. Resets in: 10m16s');
+          },
+        };
+      },
+    });
+
+    const after = getStats();
+    const afterModel = after.modelCounts['gemini-2.5-flash'];
+
+    assert.equal(result.status, 429);
+    assert.deepEqual(attempts, accounts.map(a => a.apiKey));
+    assert.equal(after.totalRequests - before.totalRequests, 1);
+    assert.equal(after.successCount - before.successCount, 0);
+    assert.equal(after.errorCount - before.errorCount, 1);
+    assert.equal(afterModel.requests - beforeModel.requests, 1);
+    assert.equal(afterModel.success - beforeModel.success, 0);
+    assert.equal(afterModel.errors - beforeModel.errors, 1);
   });
 });
