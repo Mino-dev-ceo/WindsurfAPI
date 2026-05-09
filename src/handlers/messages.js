@@ -69,6 +69,21 @@ function sha256Hex(value) {
   return createHash('sha256').update(String(value || '')).digest('hex');
 }
 
+function sha256Base64(value) {
+  return createHash('sha256').update(String(value || '')).digest('base64');
+}
+
+function buildThinkingSignature(msgId, model, thinking) {
+  const seed = `mino-thinking-signature:${msgId}:${model}:${thinking || ''}`;
+  const parts = [
+    createHash('sha512').update(`${seed}:0`).digest(),
+    createHash('sha512').update(`${seed}:1`).digest(),
+    createHash('sha512').update(`${seed}:2`).digest(),
+    createHash('sha256').update(`${seed}:3`).digest(),
+  ];
+  return Buffer.concat(parts).toString('base64');
+}
+
 // Real Claude Code 2.1.120 traffic carries metadata.user_id as a
 // JSON-encoded string with shape {device_id, account_uuid, session_id}.
 // Older Anthropic SDK clients send a plain string. The proxy currently
@@ -344,6 +359,7 @@ function openAIToAnthropic(result, model, msgId) {
     content.push({
       type: 'thinking',
       thinking,
+      signature: buildThinkingSignature(msgId, model, thinking),
     });
   }
   if (choice?.message?.tool_calls?.length) {
@@ -440,6 +456,7 @@ class AnthropicStreamTranslator {
     this.messageStarted = false;
     this.messageStopped = false;
     this.pendingSseBuf = '';
+    this.activeThinking = '';
   }
 
   send(event, data) {
@@ -478,6 +495,7 @@ class AnthropicStreamTranslator {
     let content_block;
     if (type === 'text') content_block = { type: 'text', text: '' };
     else if (type === 'thinking') {
+      this.activeThinking = '';
       content_block = { type: 'thinking', thinking: '' };
     }
     else if (type === 'tool_use') content_block = { type: 'tool_use', id: extra.id, name: extra.name, input: {} };
@@ -508,10 +526,21 @@ class AnthropicStreamTranslator {
   emitThinkingDelta(text) {
     if (!text) return;
     if (this.current?.type !== 'thinking') this.startBlock('thinking');
+    this.activeThinking += text;
     this.send('content_block_delta', {
       type: 'content_block_delta',
       index: this.current.index,
       delta: { type: 'thinking_delta', thinking: text },
+    });
+  }
+
+  emitThinkingSignature() {
+    if (this.current?.type !== 'thinking') return;
+    const signature = buildThinkingSignature(this.msgId, this.model, this.activeThinking);
+    this.send('content_block_delta', {
+      type: 'content_block_delta',
+      index: this.current.index,
+      delta: { type: 'signature_delta', signature },
     });
   }
 
@@ -583,6 +612,9 @@ class AnthropicStreamTranslator {
   finish() {
     if (this.messageStopped) return;
     this.messageStopped = true;
+    if (this.current?.type === 'thinking' && this.activeThinking) {
+      this.emitThinkingSignature();
+    }
     this.closeCurrentBlock();
     const u = this.finalUsage || {};
     this.send('message_delta', {
